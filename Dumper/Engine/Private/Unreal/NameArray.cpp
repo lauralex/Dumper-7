@@ -7,6 +7,8 @@
 #include "Platform.h"
 #include "Architecture.h"
 
+#include "RemoteMemory.h"
+
 uint8* NameArray::GNames = nullptr;
 
 FNameEntry::FNameEntry(void* Ptr)
@@ -47,26 +49,26 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 		Off::FNameEntry::NamePool::StringOffset = NameEntryStringOffset;
 		Off::FNameEntry::NamePool::HeaderOffset = NameEntryStringOffset == 6 ? 4 : 0;
 
-		const uint8* AssumedBytePropertyEntry = *reinterpret_cast<uint8* const*>(FirstChunkPtr) + NameEntryStringOffset + NoneStrLen;
+		// FirstChunkPtr points at the chunks array header; first entry [0] is the pointer to
+		// the first chunk (the "None" entry block). Read that pointer remotely, then scan
+		// forward for the "ByteProperty" header to determine the shift count used to encode
+		// the length field in the FNameEntry header.
+		const uintptr_t firstChunkAddr = RDeref<uintptr_t>(FirstChunkPtr);
+		uintptr_t candidate = firstChunkAddr + NameEntryStringOffset + NoneStrLen;
 
-		/* Check if there's pading after an FNameEntry. Check if there's up to 0x4 bytes padding. */
-		for (int i = 0; i < 0x4; i++)
+		for (int i = 0; i < 0x4; ++i)
 		{
-			const uint32 FirstPartOfByteProperty = *reinterpret_cast<const uint32*>(AssumedBytePropertyEntry + NameEntryStringOffset);
-
+			const uint32 FirstPartOfByteProperty = RDeref<uint32>(candidate + NameEntryStringOffset);
 			if (FirstPartOfByteProperty == BytePropertyStartAsUint32)
 				break;
-
-			AssumedBytePropertyEntry += 0x1;
+			candidate += 1;
 		}
 
-		uint16 BytePropertyHeader = *reinterpret_cast<const uint16*>(AssumedBytePropertyEntry + Off::FNameEntry::NamePool::HeaderOffset);
-
-		/* Shifiting past the size of the header is not allowed, so limmit the shiftcount here */
+		uint16 BytePropertyHeader = RDeref<uint16>(candidate + Off::FNameEntry::NamePool::HeaderOffset);
 		constexpr int32 MaxAllowedShiftCount = sizeof(BytePropertyHeader) * 0x8;
 
 		while (BytePropertyHeader != BytePropertyStrLen && FNameEntryLengthShiftCount < MaxAllowedShiftCount)
-		{			
+		{
 			FNameEntryLengthShiftCount++;
 			BytePropertyHeader >>= 1;
 		}
@@ -74,21 +76,23 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 		if (FNameEntryLengthShiftCount == MaxAllowedShiftCount)
 		{
 			std::cerr << "\nDumper-7: Error, couldn't get FNameEntryLengthShiftCount!\n" << std::endl;
-			GetStr = [](uint8* NameEntry) -> std::wstring { return L"Invalid FNameEntryLengthShiftCount!"; };
+			GetStr = [](uint8* NameEntry) -> std::wstring { (void)NameEntry; return L"Invalid FNameEntryLengthShiftCount!"; };
 			return;
 		}
 
 		GetStr = [](uint8* NameEntry) -> std::wstring
 		{
-			const uint16 HeaderWithoutNumber = *reinterpret_cast<uint16*>(NameEntry + Off::FNameEntry::NamePool::HeaderOffset);
+			// NameEntry is a remote VA. Read the header word first, compute the string length,
+			// then bulk-read the string payload into a local buffer.
+			const uint16 HeaderWithoutNumber = RDeref<uint16>(NameEntry + Off::FNameEntry::NamePool::HeaderOffset);
 			const int32 NameLen = HeaderWithoutNumber >> FNameEntry::FNameEntryLengthShiftCount;
 
 			if (NameLen == 0)
 			{
 				const int32 EntryIdOffset = Off::FNameEntry::NamePool::StringOffset + ((Off::FNameEntry::NamePool::StringOffset == 6) * 2);
 
-				const int32 NextEntryIndex = *reinterpret_cast<int32*>(NameEntry + EntryIdOffset);
-				const int32 Number = *reinterpret_cast<int32*>(NameEntry + EntryIdOffset + sizeof(int32));
+				const int32 NextEntryIndex = RDeref<int32>(NameEntry + EntryIdOffset);
+				const int32 Number = RDeref<int32>(NameEntry + EntryIdOffset + sizeof(int32));
 
 				if (Number > 0)
 					return NameArray::GetNameEntry(NextEntryIndex).GetWString() + L'_' + std::to_wstring(Number - 1);
@@ -96,21 +100,34 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 				return NameArray::GetNameEntry(NextEntryIndex).GetWString();
 			}
 
-			if (HeaderWithoutNumber & NameWideMask)
-				return std::wstring(reinterpret_cast<const wchar_t*>(NameEntry + Off::FNameEntry::NamePool::StringOffset), NameLen);
+			// Sanity clamp to avoid huge reads on corrupt pointers.
+			const int32 clampedLen = (NameLen > 0x400) ? 0x400 : NameLen;
+			const uintptr_t stringAddr = reinterpret_cast<uintptr_t>(NameEntry) + Off::FNameEntry::NamePool::StringOffset;
 
-			return UtfN::StringToWString(std::string(reinterpret_cast<const char*>(NameEntry + Off::FNameEntry::NamePool::StringOffset), NameLen));
+			if (HeaderWithoutNumber & NameWideMask)
+			{
+				std::wstring wide(clampedLen, L'\0');
+				RemoteMemory::ReadBuffer(stringAddr, wide.data(), clampedLen * sizeof(wchar_t), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+				return wide;
+			}
+
+			std::string narrow(clampedLen, '\0');
+			RemoteMemory::ReadBuffer(stringAddr, narrow.data(), clampedLen, RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+			return UtfN::StringToWString(narrow);
 		};
 	}
 	else
 	{
-		const uint8_t* FNameEntryNone =     static_cast<uint8_t*>(NameArray::GetNameEntry(0x0).GetAddress());
-		const uint8_t* FNameEntryIdxThree = static_cast<uint8_t*>(NameArray::GetNameEntry(0x3).GetAddress());
-		const uint8_t* FNameEntryIdxEight = static_cast<uint8_t*>(NameArray::GetNameEntry(0x8).GetAddress());
+		// Legacy TNameEntryArray path. External mode does not support this — but we can still
+		// compute the offsets if somehow this path is reached via a manual override. The bytes
+		// at FNameEntry[0] / [3] / [8] are read from the target via RemoteMemory.
+		const uintptr_t FNameEntryNone     = reinterpret_cast<uintptr_t>(NameArray::GetNameEntry(0x0).GetAddress());
+		const uintptr_t FNameEntryIdxThree = reinterpret_cast<uintptr_t>(NameArray::GetNameEntry(0x3).GetAddress());
+		const uintptr_t FNameEntryIdxEight = reinterpret_cast<uintptr_t>(NameArray::GetNameEntry(0x8).GetAddress());
 
 		for (int i = 0; i < 0x20; i++)
 		{
-			if (*reinterpret_cast<const uint32*>(FNameEntryNone + i) == 'enoN') // None
+			if (RDeref<uint32>(FNameEntryNone + i) == 'enoN') // None
 			{
 				Off::FNameEntry::NameArray::StringOffset = i;
 				break;
@@ -119,9 +136,8 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 
 		for (int i = 0; i < 0x20; i++)
 		{
-			// lowest bit is bIsWide mask, shift right by 1 to get the index
-			if ((*reinterpret_cast<const uint32*>(FNameEntryIdxThree + i) >> 1) == 0x3 &&
-				(*reinterpret_cast<const uint32*>(FNameEntryIdxEight + i) >> 1) == 0x8)
+			if ((RDeref<uint32>(FNameEntryIdxThree + i) >> 1) == 0x3 &&
+				(RDeref<uint32>(FNameEntryIdxEight + i) >> 1) == 0x8)
 			{
 				Off::FNameEntry::NameArray::IndexOffset = i;
 				break;
@@ -130,50 +146,60 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 
 		GetStr = [](uint8* NameEntry) -> std::wstring
 		{
-			const int32 NameIdx = *reinterpret_cast<int32*>(NameEntry + Off::FNameEntry::NameArray::IndexOffset);
-			const void* NameString = reinterpret_cast<void*>(NameEntry + Off::FNameEntry::NameArray::StringOffset);
+			const int32 NameIdx = RDeref<int32>(NameEntry + Off::FNameEntry::NameArray::IndexOffset);
+			const uintptr_t stringAddr = reinterpret_cast<uintptr_t>(NameEntry) + Off::FNameEntry::NameArray::StringOffset;
 
 			if (NameIdx & NameWideMask)
-				return std::wstring(reinterpret_cast<const wchar_t*>(NameString));
+			{
+				wchar_t buf[0x200]{};
+				RemoteMemory::ReadBuffer(stringAddr, buf, sizeof(buf), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+				return std::wstring(buf);
+			}
 
-			return UtfN::StringToWString<std::string>(reinterpret_cast<const char*>(NameString));
+			char buf[0x200]{};
+			RemoteMemory::ReadBuffer(stringAddr, buf, sizeof(buf), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+			return UtfN::StringToWString<std::string>(buf);
 		};
 	}
 }
 
-bool NameArray::InitializeNameArray(uint8_t* NameArray)
+bool NameArray::InitializeNameArray(uint8_t* NameArrayPtr)
 {
+	// Legacy TNameEntryArray support. External mode does not support this shape (the original
+	// discovery path called a function pointer in the target to verify the array). Leaving
+	// the code structurally intact for completeness, but it is no longer exercised externally
+	// because TryFindNameArray_Windows returns false below.
 	int32 ValidPtrCount = 0x0;
 	int32 ZeroQWordCount = 0x0;
 
-	int32 PerChunk = 0x0;
-
-	if (!NameArray || Platform::IsBadReadPtr(NameArray))
+	if (!NameArrayPtr || Platform::IsBadReadPtr(NameArrayPtr))
 		return false;
 
 	for (int i = 0; i < 0x800; i += sizeof(void*))
 	{
-		uint8_t* SomePtr = *reinterpret_cast<uint8_t**>(NameArray + i);
+		const uintptr_t SomePtrAddr = reinterpret_cast<uintptr_t>(NameArrayPtr) + i;
+		const uintptr_t SomePtr = RDeref<uintptr_t>(SomePtrAddr);
 
 		if (SomePtr == 0)
 		{
 			ZeroQWordCount++;
 		}
-		else if (ZeroQWordCount == 0x0 && SomePtr != nullptr)
+		else if (ZeroQWordCount == 0x0)
 		{
 			ValidPtrCount++;
 		}
-		else if (ZeroQWordCount > 0 && SomePtr != 0)
+		else if (ZeroQWordCount > 0)
 		{
-			int32 NumElements = *reinterpret_cast<int32_t*>(NameArray + i);
-			int32 NumChunks = *reinterpret_cast<int32_t*>(NameArray + i + 4);
+			const int32 NumElements = RDeref<int32>(SomePtrAddr);
+			const int32 NumChunks = RDeref<int32>(SomePtrAddr + 4);
+			(void)NumElements;
 
 			if (NumChunks == ValidPtrCount)
 			{
 				Off::NameArray::NumElements = i;
 				Off::NameArray::MaxChunkIndex = i + 4;
 
-				ByIndex = [](void* NamesArray, int32 ComparisonIndex, int32 NamePoolBlockOffsetBits) -> void*
+				ByIndex = [](void* NamesArray, int32 ComparisonIndex, int32 /*NamePoolBlockOffsetBits*/) -> void*
 				{
 					const int32 ChunkIdx = ComparisonIndex / 0x4000;
 					const int32 InChunk = ComparisonIndex % 0x4000;
@@ -181,7 +207,9 @@ bool NameArray::InitializeNameArray(uint8_t* NameArray)
 					if (ComparisonIndex > NameArray::GetNumElements())
 						return nullptr;
 
-					return reinterpret_cast<void***>(NamesArray)[ChunkIdx][InChunk];
+					const uintptr_t arrayAddr = reinterpret_cast<uintptr_t>(NamesArray);
+					const uintptr_t chunkPtr = RDeref<uintptr_t>(arrayAddr + ChunkIdx * sizeof(void*));
+					return reinterpret_cast<void*>(RDeref<uintptr_t>(chunkPtr + InChunk * sizeof(void*)));
 				};
 
 				return true;
@@ -196,14 +224,13 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 {
 	Off::NameArray::MaxChunkIndex = 0x0;
 	Off::NameArray::ByteCursor = 0x4;
-
 	Off::NameArray::ChunksStart = 0x10;
 
 	bool bWasMaxChunkIndexFound = false;
 
 	for (int i = 0x0; i < 0x20; i += 4)
 	{
-		const int32 PossibleMaxChunkIdx = *reinterpret_cast<int32*>(NamePool + i);
+		const int32 PossibleMaxChunkIdx = RDeref<int32>(NamePool + i);
 
 		if (PossibleMaxChunkIdx <= 0 || PossibleMaxChunkIdx > 0x10000)
 			continue;
@@ -211,7 +238,6 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 		int32 NotNullptrCount = 0x0;
 		bool bFoundFirstPtr = false;
 
-		/* Number of invalid pointers we can encounter before we assume that there are no valid pointers anymore. */
 		constexpr int32 MaxAllowedNumInvalidPtrs = 0x500;
 		int32 NumPtrsSinceLastValid = 0x0;
 
@@ -219,7 +245,7 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 		{
 			const int32 ChunkOffset = i + 8 + j + (i % 8);
 
-			if ((*reinterpret_cast<uint8_t**>(NamePool + ChunkOffset)) != nullptr)
+			if (RDeref<uintptr_t>(NamePool + ChunkOffset) != 0)
 			{
 				NotNullptrCount++;
 				NumPtrsSinceLastValid = 0;
@@ -233,8 +259,6 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 			else
 			{
 				NumPtrsSinceLastValid++;
-
-				/* The last time we've seen a non-nullptr value was 0x500 iterations ago. It's safe to say we wont find any more. */
 				if (NumPtrsSinceLastValid == MaxAllowedNumInvalidPtrs)
 					break;
 			}
@@ -255,9 +279,11 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 	constexpr uint64 CoreUObjAsUint64 = 0x6A624F5565726F43; // little endian "jbOUeroC" ["/Script/CoreUObject"]
 	constexpr uint32 NoneAsUint32 = 0x656E6F4E; // little endian "None"
 
-	uint8_t** ChunkPtr = reinterpret_cast<uint8_t**>(NamePool + Off::NameArray::ChunksStart);
+	const uintptr_t chunkPtrRemoteAddr = reinterpret_cast<uintptr_t>(NamePool) + Off::NameArray::ChunksStart;
+	const uintptr_t firstChunkAddr = RDeref<uintptr_t>(chunkPtrRemoteAddr);
+	if (firstChunkAddr == 0)
+		return false;
 
-	// "/Script/CoreUObject"
 	bool bFoundCoreUObjectString = false;
 	int64 FNameEntryHeaderSize = 0x0;
 
@@ -265,11 +291,11 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 
 	for (int i = 0; i < LoopLimit; i++)
 	{
-		if (*reinterpret_cast<uint32*>(*ChunkPtr + i) == NoneAsUint32 && FNameEntryHeaderSize == 0)
+		if (RDeref<uint32>(firstChunkAddr + i) == NoneAsUint32 && FNameEntryHeaderSize == 0)
 		{
 			FNameEntryHeaderSize = i;
 		}
-		else if (*reinterpret_cast<uint64*>(*ChunkPtr + i) == CoreUObjAsUint64)
+		else if (RDeref<uint64>(firstChunkAddr + i) == CoreUObjAsUint64)
 		{
 			bFoundCoreUObjectString = true;
 			break;
@@ -292,44 +318,41 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 		if (ChunkIdx < 0 || ChunkIdx > GetNumChunks() || bIsBeyondLastChunk)
 			return nullptr;
 
-		uint8_t* ChunkPtr = reinterpret_cast<uint8_t*>(NamesArray) + 0x10;
-
-		return reinterpret_cast<uint8_t**>(ChunkPtr)[ChunkIdx] + InChunkOffset;
+		const uintptr_t chunkArrayAddr = reinterpret_cast<uintptr_t>(NamesArray) + 0x10;
+		const uintptr_t chunkBase = RDeref<uintptr_t>(chunkArrayAddr + ChunkIdx * sizeof(void*));
+		return reinterpret_cast<void*>(chunkBase + InChunkOffset);
 	};
 
 	Settings::Internal::bUseNamePool = true;
-	FNameEntry::Init(reinterpret_cast<uint8*>(ChunkPtr), FNameEntryHeaderSize);
+	FNameEntry::Init(reinterpret_cast<uint8*>(chunkPtrRemoteAddr), FNameEntryHeaderSize);
 
 	return true;
 }
 
 
-/* 
- * Finds a call to FName::GetNames, OR a reference to GNames directly, if the call has been inlined
- * 
+/*
+ * Finds a call to FName::GetNames, OR a reference to GNames directly, if the call has been inlined.
  * returns { GetNames/GNames, bIsGNamesDirectly };
 */
 inline std::pair<uintptr_t, bool> FindFNameGetNamesOrGNames_Windows(const uintptr_t EnterCriticalSectionAddress, const uintptr_t StartAddress)
 {
 #ifdef PLATFORM_WINDOWS
 
-	/* 2 bytes operation + 4 bytes relative offset */
-	constexpr int32 ASMRelativeCallSizeBytes = 0x6;
+	// NOTE: this helper is only referenced by the legacy TNameEntryArray path which returns
+	// early in external mode (TryFindNameArray_Windows returns false). Left intact so that
+	// manual-override use cases can still reach it via TryInit(OffsetOverride, ...).
 
-	/* Range from "ByteProperty" which we want to search upwards for "GetNames" call */
+	constexpr int32 ASMRelativeCallSizeBytes = 0x6;
 	constexpr int32 GetNamesCallSearchRange = 0x150;
 
-	/* Find a reference to the string "ByteProperty" in 'FName::StaticInit' */
 	const uint8* BytePropertyStringAddress = static_cast<uint8*>(Platform::FindByStringInAllSections(L"ByteProperty", StartAddress, 0x0, Settings::General::bSearchOnlyExecutableSectionsForStrings));
-
-	/* Important to prevent infinite-recursion */
 	if (!BytePropertyStringAddress)
 		return { 0x0, false };
 
 	for (int i = 0; i < GetNamesCallSearchRange; i++)
 	{
-		/* Check upwards (yes negative indexing) for a relative call opcode */
-		if (BytePropertyStringAddress[-i] != 0xFF)
+		const uint8 byteBefore = RDeref<uint8>(BytePropertyStringAddress - i);
+		if (byteBefore != 0xFF)
 			continue;
 
 #if defined(_WIN64)
@@ -342,12 +365,10 @@ inline std::pair<uintptr_t, bool> FindFNameGetNamesOrGNames_Windows(const uintpt
 			continue;
 
 		const uintptr_t InstructionAfterCall = reinterpret_cast<uintptr_t>(BytePropertyStringAddress - (i - ASMRelativeCallSizeBytes));
-		
-		/* Check if we're dealing with a 'call' opcode */
-		if (*reinterpret_cast<const uint8*>(InstructionAfterCall) == 0xE8)
+
+		if (RDeref<uint8>(InstructionAfterCall) == 0xE8)
 			return { Architecture_x86_64::Resolve32BitRelativeCall(InstructionAfterCall), false };
 
-		// Looks like on 32bit like literally everything is absolute???? fuck you
 #if defined(_WIN64)
 		return { Architecture_x86_64::Resolve32BitRelativeMove(InstructionAfterCall), true };
 #elif defined(_WIN32)
@@ -355,7 +376,6 @@ inline std::pair<uintptr_t, bool> FindFNameGetNamesOrGNames_Windows(const uintpt
 #endif
 	}
 
-	/* Continue and search for another reference to "ByteProperty", safe because we're checking if another string-ref was found*/
 	return FindFNameGetNamesOrGNames_Windows(EnterCriticalSectionAddress, reinterpret_cast<uintptr_t>(BytePropertyStringAddress) + ASMRelativeCallSizeBytes);
 
 #endif // PLATFORM_WINDOWS
@@ -363,122 +383,65 @@ inline std::pair<uintptr_t, bool> FindFNameGetNamesOrGNames_Windows(const uintpt
 
 bool NameArray::TryFindNameArray_Windows()
 {
-#ifdef PLATFORM_WINDOWS
-
-	/* Type of 'static TNameEntryArray& FName::GetNames()' */
-	using GetNameType = void* (*)();
-
-	/* Range from 'FName::GetNames' which we want to search down for 'mov register, GNames' */
-	constexpr int32 GetNamesCallSearchRange = 0x100;
-
-	const void* EnterCriticalSectionAddress = Platform::GetAddressOfImportedFunctionFromAnyModule("kernel32.dll", "EnterCriticalSection");
-
-	auto [Address, bIsGNamesDirectly] = FindFNameGetNamesOrGNames_Windows(reinterpret_cast<uintptr_t>(EnterCriticalSectionAddress), Platform::GetModuleBase());
-
-	if (Address == 0x0)
-		return false;
-
-	if (bIsGNamesDirectly)
-	{
-		if (!Platform::IsAddressInProcessRange(Address) || Platform::IsBadReadPtr(*reinterpret_cast<void**>(Address)))
-			return false;
-
-		Off::InSDK::NameArray::GNames = Platform::GetOffset(Address);
-		return true;
-	}
-
-	// TODO (encryqed): Fix below for 32-bit ue shit 
-
-	/* Call GetNames to retreive the pointer to the allocation of the name-table, used for later comparison */
-	void* Names = reinterpret_cast<GetNameType>(Address)();
-
-	for (int i = 0; i < GetNamesCallSearchRange; i++)
-	{
-		/* Check upwards (yes negative indexing) for a relative call opcode */
-		if (*reinterpret_cast<const uint16*>(Address + i) != 0x8B48)
-			continue;
-
-		const uintptr_t MoveTarget = Architecture_x86_64::Resolve32BitRelativeMove(Address + i);
-
-		if (!Platform::IsAddressInProcessRange(MoveTarget))
-			continue;
-
-		const void* ValueOfMoveTargetAsPtr = *reinterpret_cast<void**>(MoveTarget);
-
-		if (Platform::IsBadReadPtr(ValueOfMoveTargetAsPtr) || ValueOfMoveTargetAsPtr != Names)
-			continue;
-
-		Off::InSDK::NameArray::GNames = Platform::GetOffset(MoveTarget);
-		return true;
-	}
-	
+	// External mode disables the legacy TNameEntryArray path. It depends on reinterpret_cast
+	// to a function pointer in the target and actually *calling* it (NameArray.cpp:393 in the
+	// original code), which cannot work when the dumper runs outside the target address space.
+	// UE4.11–UE4.22 games using TNameEntryArray are not supported in v1 external dumps.
+	std::cerr << "[NameArray] Skipping TryFindNameArray_Windows in external mode; FNamePool (UE4.23+) only.\n";
 	return false;
-
-#endif // PLATFORM_WINDOWS
 }
 
 bool NameArray::TryFindNamePool_Windows()
 {
 #ifdef PLATFORM_WINDOWS
 
-	// TODO (encryqed): Fix this below for 32-bit ue games ig?
-
-	/* Number of bytes we want to search for an indirect call to InitializeSRWLock */
 	constexpr int32 InitSRWLockSearchRange = 0x50;
-
-	/* Number of bytes we want to search for lea instruction loading the string "ByteProperty" */
 	constexpr int32 BytePropertySearchRange = 0x2A0;
 
-	/* FNamePool::FNamePool contains a call to InitializeSRWLock or RtlInitializeSRWLock, we're going to check for that later */
 	const uintptr_t InitSRWLockAddress = reinterpret_cast<uintptr_t>(Platform::GetAddressOfImportedFunctionFromAnyModule("kernel32.dll", "InitializeSRWLock"));
 	const uintptr_t RtlInitSRWLockAddress = reinterpret_cast<uintptr_t>(Platform::GetAddressOfImportedFunctionFromAnyModule("ntdll.dll", "RtlInitializeSRWLock"));
 
-	/* Singleton instance of FNamePool, which is passed as a parameter to FNamePool::FNamePool */
+	std::cerr << std::format("[NameArray] InitSRWLock IAT target:     0x{:X}\n", InitSRWLockAddress);
+	std::cerr << std::format("[NameArray] RtlInitSRWLock IAT target:  0x{:X}\n", RtlInitSRWLockAddress);
+
 	void* NamePoolIntance = nullptr;
-
-	uintptr_t SigOccurrence = 0x0;;
-
-	uintptr_t Counter = 0x0;
+	uintptr_t SigOccurrence = 0x0;
+	int patternMatchCount = 0;
+	int ctorInRangeCount = 0;
+	int srwCallMatchCount = 0;
 
 	while (!NamePoolIntance)
 	{
-		/* add 0x1 so we don't find the same occurence again and cause an infinite loop (20min. of debugging for that) */
 		if (SigOccurrence > 0x0)
 			SigOccurrence += 0x1;
 
-		/* Find the next occurence of this signature to see if that may be a call to the FNamePool constructor */
 		SigOccurrence = reinterpret_cast<uintptr_t>(Platform::FindPattern("48 8D 0D ? ? ? ? E8", 0x0, true, SigOccurrence));
-
 		if (SigOccurrence == 0x0)
 			break;
+		++patternMatchCount;
 
 		constexpr int32 SizeOfMovInstructionBytes = 0x7;
-
 		const uintptr_t PossibleConstructorAddress = Architecture_x86_64::Resolve32BitRelativeCall(SigOccurrence + SizeOfMovInstructionBytes);
 
 		if (!Platform::IsAddressInProcessRange(PossibleConstructorAddress))
 			continue;
+		++ctorInRangeCount;
 
 		for (int i = 0; i < InitSRWLockSearchRange; i++)
 		{
-			/* Check for a relative call with the opcodes FF 15 00 00 00 00 */
-			if (*reinterpret_cast<uint16*>(PossibleConstructorAddress + i) != 0x15FF)
+			if (RDeref<uint16>(PossibleConstructorAddress + i) != 0x15FF)
 				continue;
 
 			const uintptr_t RelativeCallTarget = Architecture_x86_64::Resolve32BitSectionRelativeCall(PossibleConstructorAddress + i);
-
 			if (!Platform::IsAddressInProcessRange(RelativeCallTarget))
 				continue;
 
-			const uintptr_t ValueOfCallTarget = *reinterpret_cast<uintptr_t*>(RelativeCallTarget);
-
+			const uintptr_t ValueOfCallTarget = RDeref<uintptr_t>(RelativeCallTarget);
 			if (ValueOfCallTarget != InitSRWLockAddress && ValueOfCallTarget != RtlInitSRWLockAddress)
 				continue;
+			++srwCallMatchCount;
 
-			/* Try to find the "ByteProperty" string, as it's always referenced in FNamePool::FNamePool, so we use it to verify that we got the right function */
 			const void* StringRef = Platform::FindByStringInAllSections(L"ByteProperty", PossibleConstructorAddress, BytePropertySearchRange, Settings::General::bSearchOnlyExecutableSectionsForStrings);
-
-			/* We couldn't find a wchar_t string L"ByteProperty", now see if we can find a char string "ByteProperty" */
 			if (StringRef == nullptr)
 				StringRef = Platform::FindByStringInAllSections("ByteProperty", PossibleConstructorAddress, BytePropertySearchRange, Settings::General::bSearchOnlyExecutableSectionsForStrings);
 
@@ -489,6 +452,9 @@ bool NameArray::TryFindNamePool_Windows()
 			}
 		}
 	}
+
+	std::cerr << std::format("[NameArray] LEA+call pattern hits: {}, ctor-in-range: {}, SRW-match: {}\n",
+		patternMatchCount, ctorInRangeCount, srwCallMatchCount);
 
 	if (NamePoolIntance)
 	{
@@ -506,21 +472,20 @@ bool NameArray::TryInit(bool bIsTestOnly)
 	const uintptr_t ImageBase = Platform::GetModuleBase();
 
 	uint8* GNamesAddress = nullptr;
-
 	bool bFoundNameArray = false;
 	bool bFoundnamePool = false;
 
 	if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindNameArray))
 	{
 		std::cerr << std::format("Found 'TNameEntryArray GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
-		GNamesAddress = *reinterpret_cast<uint8**>(ImageBase + Off::InSDK::NameArray::GNames);// Derefernce
+		GNamesAddress = reinterpret_cast<uint8*>(RDeref<uintptr_t>(ImageBase + Off::InSDK::NameArray::GNames));
 		Settings::Internal::bUseNamePool = false;
 		bFoundNameArray = true;
 	}
 	else if (CALL_PLATFORM_SPECIFIC_FUNCTION(NameArray::TryFindNamePool))
 	{
 		std::cerr << std::format("Found 'FNamePool GNames' at offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
-		GNamesAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames); // No derefernce
+		GNamesAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames);
 		Settings::Internal::bUseNamePool = true;
 		bFoundnamePool = true;
 	}
@@ -545,12 +510,10 @@ bool NameArray::TryInit(bool bIsTestOnly)
 	{
 		GNames = GNamesAddress;
 		Settings::Internal::bUseNamePool = true;
-		/* FNameEntry::Init() was moved into NameArray::InitializeNamePool to avoid duplicated logic */
 		return true;
 	}
 
 	std::cerr << "The address that was found couldn't be used by the generator, this might be due to GNames-encryption.\n" << std::endl;
-
 	return false;
 }
 
@@ -572,14 +535,14 @@ bool NameArray::TryInit(int32 OffsetOverride, bool bIsNamePool, const char* cons
 	if (bIsNameArrayOverride)
 	{
 		std::cerr << std::format("Overwrote offset: 'TNameEntryArray GNames' set as offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
-		GNamesAddress = *reinterpret_cast<uint8**>(ImageBase + Off::InSDK::NameArray::GNames);// Derefernce
+		GNamesAddress = reinterpret_cast<uint8*>(RDeref<uintptr_t>(ImageBase + Off::InSDK::NameArray::GNames));
 		Settings::Internal::bUseNamePool = false;
 		bFoundNameArray = true;
 	}
 	else if (bIsNamePoolOverride)
 	{
 		std::cerr << std::format("Overwrote offset: 'FNamePool GNames' set as offset 0x{:X}\n", Off::InSDK::NameArray::GNames) << std::endl;
-		GNamesAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames); // No derefernce
+		GNamesAddress = reinterpret_cast<uint8*>(ImageBase + Off::InSDK::NameArray::GNames);
 		Settings::Internal::bUseNamePool = true;
 		bFoundnamePool = true;
 	}
@@ -601,18 +564,15 @@ bool NameArray::TryInit(int32 OffsetOverride, bool bIsNamePool, const char* cons
 	{
 		GNames = GNamesAddress;
 		Settings::Internal::bUseNamePool = true;
-		/* FNameEntry::Init() was moved into NameArray::InitializeNamePool to avoid duplicated logic */
 		return true;
 	}
 
 	std::cerr << "The address was overwritten, but couldn't be used. This might be due to GNames-encryption.\n" << std::endl;
-
 	return false;
 }
 
 bool NameArray::SetGNamesWithoutCommitting()
 {
-	/* GNames is already set */
 	if (Off::InSDK::NameArray::GNames != 0x0)
 		return false;
 
@@ -637,8 +597,6 @@ void NameArray::PostInit()
 {
 	if (GNames && Settings::Internal::bUseNamePool)
 	{
-		// Reverse-order iteration because newer objects are more likely to have a chunk-index equal to NumChunks - 1
-		
 		NameArray::FNameBlockOffsetBits = 0xE;
 
 		int i = ObjectArray::Num();
@@ -675,17 +633,17 @@ void NameArray::PostInit()
 
 int32 NameArray::GetNumChunks()
 {
-	return *reinterpret_cast<int32*>(GNames + Off::NameArray::MaxChunkIndex);
+	return RDeref<int32>(GNames + Off::NameArray::MaxChunkIndex);
 }
 
 int32 NameArray::GetNumElements()
 {
-	return !Settings::Internal::bUseNamePool ? *reinterpret_cast<int32*>(GNames + Off::NameArray::NumElements) : 0;
+	return !Settings::Internal::bUseNamePool ? RDeref<int32>(GNames + Off::NameArray::NumElements) : 0;
 }
 
 int32 NameArray::GetByteCursor()
 {
-	return Settings::Internal::bUseNamePool ? *reinterpret_cast<int32*>(GNames + Off::NameArray::ByteCursor) : 0;
+	return Settings::Internal::bUseNamePool ? RDeref<int32>(GNames + Off::NameArray::ByteCursor) : 0;
 }
 
 FNameEntry NameArray::GetNameEntry(const void* Name)
@@ -697,4 +655,3 @@ FNameEntry NameArray::GetNameEntry(int32 Idx)
 {
 	return ByIndex(GNames, Idx, FNameBlockOffsetBits);
 }
-

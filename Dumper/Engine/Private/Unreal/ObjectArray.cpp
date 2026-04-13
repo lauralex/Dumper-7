@@ -9,6 +9,7 @@
 #include "Utils.h"
 
 #include "Platform.h"
+#include "RemoteMemory.h"
 
 
 namespace fs = std::filesystem;
@@ -61,38 +62,43 @@ constexpr inline std::array FChunkedFixedUObjectArrayLayouts =
 
 bool IsAddressValidGObjects(const uintptr_t Address, const FFixedUObjectArrayLayout& Layout)
 {
-	/* It is assumed that the FUObjectItem layout is constant amongst all games using FFixedUObjectArray for ObjObjects. */
+	// External-mode rewrite: all header reads go through RemoteMemory::TryRead so a hypercall
+	// fault on an unmapped candidate address surfaces as failure rather than producing a
+	// zero-filled struct that might pass the loose validation below.
 	struct FUObjectItem
 	{
 		void* Object;
 		uint8_t Pad[sizeof(void*) * 2];
 	};
 
-	void* Objects = *reinterpret_cast<void**>(Address + Layout.ObjectsOffset);
-	const int32 MaxElements = *reinterpret_cast<const int32*>(Address + Layout.MaxObjectsOffset);
-	const int32 NumElements = *reinterpret_cast<const int32*>(Address + Layout.NumObjectsOffset);
+	auto objectsOpt = RemoteMemory::TryRead<uintptr_t>(Address + Layout.ObjectsOffset);
+	auto maxOpt = RemoteMemory::TryRead<int32>(Address + Layout.MaxObjectsOffset);
+	auto numOpt = RemoteMemory::TryRead<int32>(Address + Layout.NumObjectsOffset);
+	if (!objectsOpt || !maxOpt || !numOpt)
+		return false;
 
-	FUObjectItem* ObjectsButDecrypted = reinterpret_cast<FUObjectItem*>(ObjectArray::DecryptPtr(Objects));
+	const int32 MaxElements = *maxOpt;
+	const int32 NumElements = *numOpt;
+	const uintptr_t ObjectsButDecrypted = reinterpret_cast<uintptr_t>(
+		ObjectArray::DecryptPtr(reinterpret_cast<void*>(*objectsOpt)));
 
 	if (NumElements > MaxElements)
 		return false;
-
 	if (MaxElements > 0x400000)
 		return false;
-
 	if (NumElements < 0x1000)
 		return false;
-
 	if (Platform::IsBadReadPtr(ObjectsButDecrypted))
 		return false;
 
-	if (Platform::IsBadReadPtr(ObjectsButDecrypted[5].Object))
+	// FifthObject->Object field, then read through it to get InternalIndex.
+	auto fifthObjOpt = RemoteMemory::TryRead<uintptr_t>(ObjectsButDecrypted + 0x5 * sizeof(FUObjectItem));
+	if (!fifthObjOpt || *fifthObjOpt == 0)
 		return false;
 
-	const uintptr_t FifthObject = reinterpret_cast<uintptr_t>(ObjectsButDecrypted[0x5].Object);
-	const int32 IndexOfFithobject = *reinterpret_cast<int32_t*>(FifthObject + sizeof(void*) + sizeof(int32)); // FifthObject -> InternalIndex
-
-	if (IndexOfFithobject != 0x5)
+	// FifthObject -> InternalIndex at offset sizeof(void*) + sizeof(int32)
+	auto indexOpt = RemoteMemory::TryRead<int32>(*fifthObjOpt + sizeof(void*) + sizeof(int32));
+	if (!indexOpt || *indexOpt != 0x5)
 		return false;
 
 	return true;
@@ -100,53 +106,54 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FFixedUObjectArrayLay
 
 bool IsAddressValidGObjects(const uintptr_t Address, const FChunkedFixedUObjectArrayLayout& Layout)
 {
-	void* Objects = *reinterpret_cast<void**>(Address + Layout.ObjectsOffset);
-	const int32 MaxElements = *reinterpret_cast<const int32*>(Address + Layout.MaxElementsOffset);
-	const int32 NumElements = *reinterpret_cast<const int32*>(Address + Layout.NumElementsOffset);
-	const int32 MaxChunks   = *reinterpret_cast<const int32*>(Address + Layout.MaxChunksOffset);
-	const int32 NumChunks   = *reinterpret_cast<const int32*>(Address + Layout.NumChunksOffset);
+	auto objectsOpt = RemoteMemory::TryRead<uintptr_t>(Address + Layout.ObjectsOffset);
+	auto maxElemOpt = RemoteMemory::TryRead<int32>(Address + Layout.MaxElementsOffset);
+	auto numElemOpt = RemoteMemory::TryRead<int32>(Address + Layout.NumElementsOffset);
+	auto maxChunksOpt = RemoteMemory::TryRead<int32>(Address + Layout.MaxChunksOffset);
+	auto numChunksOpt = RemoteMemory::TryRead<int32>(Address + Layout.NumChunksOffset);
+	if (!objectsOpt || !maxElemOpt || !numElemOpt || !maxChunksOpt || !numChunksOpt)
+		return false;
 
-	void** ObjectsPtrButDecrypted = reinterpret_cast<void**>(ObjectArray::DecryptPtr(Objects));
+	const int32 MaxElements = *maxElemOpt;
+	const int32 NumElements = *numElemOpt;
+	const int32 MaxChunks = *maxChunksOpt;
+	const int32 NumChunks = *numChunksOpt;
+
+	const uintptr_t ObjectsPtrButDecrypted = reinterpret_cast<uintptr_t>(
+		ObjectArray::DecryptPtr(reinterpret_cast<void*>(*objectsOpt)));
 
 	if (NumChunks > 0x14 || NumChunks < 0x1)
 		return false;
-
 	if (MaxChunks > 0x5FF || MaxChunks < 0x6)
 		return false;
-
 	if (NumElements <= 0x800 || MaxElements <= 0x10000)
 		return false;
-
 	if (NumElements > MaxElements || NumChunks > MaxChunks)
 		return false;
-
 	if ((MaxElements % 0x10) != 0)
 		return false;
 
 	const int32_t ElementsPerChunk = MaxElements / MaxChunks;
-
 	if ((ElementsPerChunk % 0x10) != 0)
 		return false;
-
 	if (ElementsPerChunk < 0x8000 || ElementsPerChunk > 0x80000)
 		return false;
 
 	const bool bNumChunksFitsNumElements = ((NumElements / ElementsPerChunk) + 1) == NumChunks;
-
 	if (!bNumChunksFitsNumElements)
 		return false;
 
 	const bool bMaxChunksFitsMaxElements = (MaxElements / ElementsPerChunk) == MaxChunks;
-
 	if (!bMaxChunksFitsMaxElements)
 		return false;
 
-	if (!ObjectsPtrButDecrypted || Platform::IsBadReadPtr(ObjectsPtrButDecrypted))
+	if (ObjectsPtrButDecrypted == 0 || Platform::IsBadReadPtr(ObjectsPtrButDecrypted))
 		return false;
 
 	for (int i = 0; i < NumChunks; i++)
 	{
-		if (!ObjectsPtrButDecrypted[i] || Platform::IsBadReadPtr(ObjectsPtrButDecrypted[i]))
+		auto chunkOpt = RemoteMemory::TryRead<uintptr_t>(ObjectsPtrButDecrypted + i * sizeof(void*));
+		if (!chunkOpt || *chunkOpt == 0 || Platform::IsBadReadPtr(*chunkOpt))
 			return false;
 	}
 
@@ -158,7 +165,9 @@ void ObjectArray::InitializeFUObjectItem(uint8_t* FirstItemPtr)
 {
 	for (int i = 0x0; i < 0x20; i += 4)
 	{
-		if (!Platform::IsBadReadPtr(*reinterpret_cast<uint8_t**>(FirstItemPtr + i)))
+		const uintptr_t slotAddr = reinterpret_cast<uintptr_t>(FirstItemPtr) + i;
+		const uintptr_t slotValue = RDeref<uintptr_t>(slotAddr);
+		if (slotValue != 0 && !Platform::IsBadReadPtr(slotValue))
 		{
 			FUObjectItemInitialOffset = i;
 			break;
@@ -167,11 +176,14 @@ void ObjectArray::InitializeFUObjectItem(uint8_t* FirstItemPtr)
 
 	for (int i = FUObjectItemInitialOffset + sizeof(void*); i <= 0x38; i += 4)
 	{
-		void* SecondObject = *reinterpret_cast<uint8**>(FirstItemPtr + i);
-		void* ThirdObject  = *reinterpret_cast<uint8**>(FirstItemPtr + (i * 2) - FUObjectItemInitialOffset);
+		const uintptr_t firstBase = reinterpret_cast<uintptr_t>(FirstItemPtr);
+		const uintptr_t SecondObject = RDeref<uintptr_t>(firstBase + i);
+		const uintptr_t ThirdObject  = RDeref<uintptr_t>(firstBase + (i * 2) - FUObjectItemInitialOffset);
 
-		if (!Platform::IsBadReadPtr(SecondObject) && !Platform::IsBadReadPtr(*reinterpret_cast<void**>(SecondObject)) &&
-			!Platform::IsBadReadPtr(ThirdObject) && !Platform::IsBadReadPtr(*reinterpret_cast<void**>(ThirdObject)))
+		if (SecondObject && !Platform::IsBadReadPtr(SecondObject)
+			&& RDeref<uintptr_t>(SecondObject) && !Platform::IsBadReadPtr(RDeref<uintptr_t>(SecondObject))
+			&& ThirdObject && !Platform::IsBadReadPtr(ThirdObject)
+			&& RDeref<uintptr_t>(ThirdObject) && !Platform::IsBadReadPtr(RDeref<uintptr_t>(ThirdObject)))
 		{
 			SizeOfFUObjectItem = i - FUObjectItemInitialOffset;
 			break;
@@ -265,24 +277,29 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			std::cerr << "Found FFixedUObjectArray GObjects at offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n\n";
 
-			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 /*PerChunk*/) -> void*
 			{
 				if (Index < 0 || Index > Num())
 					return nullptr;
 
-				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
+				// ObjectsArray is a remote VA pointing at the first slot of the FUObjectArray;
+				// *ObjectsArray is the remote pointer to the flat FUObjectItem buffer.
+				uint8_t* ChunkPtr = DecryptPtr(reinterpret_cast<void*>(
+					RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ObjectsArray))));
 
-				return *reinterpret_cast<void**>(ChunkPtr + FUObjectItemOffset + (Index * FUObjectItemSize));
+				return reinterpret_cast<void*>(
+					RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ChunkPtr) + FUObjectItemOffset + (Index * FUObjectItemSize)));
 			};
 
-			uint8_t* FirstItem = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+			uint8_t* FirstItem = DecryptPtr(reinterpret_cast<void*>(
+				RDeref<uintptr_t>(GObjects + Off::FUObjectArray::GetObjectsOffset())));
 
 			ObjectArray::InitializeFUObjectItem(FirstItem);
 		}
 		else
 		{
 			GObjects = static_cast<uint8*>(GObjectsAddress);
-			
+
 			NumElementsPerChunk = Max() / MaxChunks();
 			Off::InSDK::ObjArray::ChunkSize = NumElementsPerChunk;
 
@@ -301,17 +318,26 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 				const int32 ChunkIndex = Index / PerChunk;
 				const int32 InChunkIdx = Index % PerChunk;
 
-				uint8_t* ChunkPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(ObjectsArray));
+				// Step 1: *ObjectsArray → chunks-table remote VA, decrypt if required.
+				uint8_t* ChunkPtr = DecryptPtr(reinterpret_cast<void*>(
+					RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ObjectsArray))));
 
-				uint8_t* Chunk = reinterpret_cast<uint8_t**>(ChunkPtr)[ChunkIndex];
-				uint8_t* ItemPtr = Chunk + (InChunkIdx * FUObjectItemSize);
+				// Step 2: chunks-table[ChunkIndex] → chunk base remote VA.
+				const uintptr_t Chunk = RDeref<uintptr_t>(
+					reinterpret_cast<uintptr_t>(ChunkPtr) + ChunkIndex * sizeof(void*));
 
-				return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+				// Step 3: chunk[InChunkIdx].Object at the correct item offset.
+				return reinterpret_cast<void*>(
+					RDeref<uintptr_t>(Chunk + (InChunkIdx * FUObjectItemSize) + FUObjectItemOffset));
 			};
-			
-			uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
 
-			ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+			uint8_t* ChunksPtr = DecryptPtr(reinterpret_cast<void*>(
+				RDeref<uintptr_t>(GObjects + Off::FUObjectArray::GetObjectsOffset())));
+
+			// ChunksPtr now points at the chunk table (remote VA). Read the first chunk pointer
+			// and use it as the "FirstItem" argument for InitializeFUObjectItem's probes.
+			const uintptr_t firstChunkAddr = RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ChunksPtr));
+			ObjectArray::InitializeFUObjectItem(reinterpret_cast<uint8_t*>(firstChunkAddr));
 		}
 
 		return;
@@ -341,21 +367,22 @@ void ObjectArray::Init(int32 GObjectsOffset, const FFixedUObjectArrayLayout& Obj
 	Off::FUObjectArray::bIsChunked = false;
 	Off::FUObjectArray::FixedLayout = ObjectArrayLayout.IsValid() ? ObjectArrayLayout : FFixedUObjectArrayLayouts[0];
 
-	ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+	ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 /*PerChunk*/) -> void*
 	{
 		if (Index < 0 || Index > Num())
 			return nullptr;
 
-		uint8_t* ItemPtr = *reinterpret_cast<uint8_t**>(ObjectsArray) + (Index * FUObjectItemSize);
-
-		return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+		const uintptr_t ItemsBase = RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ObjectsArray));
+		const uintptr_t ItemPtr = ItemsBase + (Index * FUObjectItemSize);
+		return reinterpret_cast<void*>(RDeref<uintptr_t>(ItemPtr + FUObjectItemOffset));
 	};
 
-	uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+	uint8_t* ChunksPtr = DecryptPtr(reinterpret_cast<void*>(
+		RDeref<uintptr_t>(GObjects + Off::FUObjectArray::GetObjectsOffset())));
 
 	std::cerr << "Overwrote FFixedUObjectArray GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
 
-	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+	ObjectArray::InitializeFUObjectItem(reinterpret_cast<uint8_t*>(RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ChunksPtr))));
 }
 
 void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChunkedFixedUObjectArrayLayout& ObjectArrayLayout, const char* const ModuleName)
@@ -377,17 +404,18 @@ void ObjectArray::Init(int32 GObjectsOffset, int32 ElementsPerChunk, const FChun
 		const int32 ChunkIndex = Index / PerChunk;
 		const int32 InChunkIdx = Index % PerChunk;
 
-		uint8_t* Chunk = (*reinterpret_cast<uint8_t***>(ObjectsArray))[ChunkIndex];
-		uint8_t* ItemPtr = reinterpret_cast<uint8_t*>(Chunk) + (InChunkIdx * FUObjectItemSize);
-
-		return *reinterpret_cast<void**>(ItemPtr + FUObjectItemOffset);
+		const uintptr_t chunkTable = RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ObjectsArray));
+		const uintptr_t chunk = RDeref<uintptr_t>(chunkTable + ChunkIndex * sizeof(void*));
+		const uintptr_t itemPtr = chunk + (InChunkIdx * FUObjectItemSize);
+		return reinterpret_cast<void*>(RDeref<uintptr_t>(itemPtr + FUObjectItemOffset));
 	};
 
-	uint8_t* ChunksPtr = DecryptPtr(*reinterpret_cast<uint8_t**>(GObjects + Off::FUObjectArray::GetObjectsOffset()));
+	uint8_t* ChunksPtr = DecryptPtr(reinterpret_cast<void*>(
+		RDeref<uintptr_t>(GObjects + Off::FUObjectArray::GetObjectsOffset())));
 
 	std::cerr << "Overwrote FChunkedFixedUObjectArray GObjects to offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n" << std::endl;
 
-	ObjectArray::InitializeFUObjectItem(*reinterpret_cast<uint8_t**>(ChunksPtr));
+	ObjectArray::InitializeFUObjectItem(reinterpret_cast<uint8_t*>(RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ChunksPtr))));
 }
 
 void ObjectArray::DumpObjects(const fs::path& Path, bool bWithPathname)
@@ -447,22 +475,22 @@ void ObjectArray::DumpObjectsWithProperties(const fs::path& Path, bool bWithPath
 
 int32 ObjectArray::Num()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
+	return RDeref<int32>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
 }
 
 int32 ObjectArray::Max()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetMaxElementsOffset());
+	return RDeref<int32>(GObjects + Off::FUObjectArray::GetMaxElementsOffset());
 }
 
 int32 ObjectArray::NumChunks()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetNumChunksOffset());
+	return RDeref<int32>(GObjects + Off::FUObjectArray::GetNumChunksOffset());
 }
 
 int32 ObjectArray::MaxChunks()
 {
-	return *reinterpret_cast<int32*>(GObjects + Off::FUObjectArray::GetMaxChunksOffset());
+	return RDeref<int32>(GObjects + Off::FUObjectArray::GetMaxChunksOffset());
 }
 
 template<typename UEType>

@@ -4,6 +4,9 @@
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
 
+#include "RemoteMemory.h"
+#include "RemoteContainers.h"
+
 
 void* UEFFieldClass::GetAddress()
 {
@@ -17,22 +20,22 @@ UEFFieldClass::operator bool() const
 
 EFieldClassID UEFFieldClass::GetId() const
 {
-	return *reinterpret_cast<EFieldClassID*>(Class + Off::FFieldClass::Id);
+	return RDeref<EFieldClassID>(Class + Off::FFieldClass::Id);
 }
 
 EClassCastFlags UEFFieldClass::GetCastFlags() const
 {
-	return *reinterpret_cast<EClassCastFlags*>(Class + Off::FFieldClass::CastFlags);
+	return RDeref<EClassCastFlags>(Class + Off::FFieldClass::CastFlags);
 }
 
 EClassFlags UEFFieldClass::GetClassFlags() const
 {
-	return *reinterpret_cast<EClassFlags*>(Class + Off::FFieldClass::ClassFlags);
+	return RDeref<EClassFlags>(Class + Off::FFieldClass::ClassFlags);
 }
 
 UEFFieldClass UEFFieldClass::GetSuper() const
 {
-	return UEFFieldClass(*reinterpret_cast<void**>(Class + Off::FFieldClass::SuperClass));
+	return UEFFieldClass(RDeref<void*>(Class + Off::FFieldClass::SuperClass));
 }
 
 FName UEFFieldClass::GetFName() const
@@ -73,7 +76,7 @@ const void* UEFField::GetAddress() const
 
 EObjectFlags UEFField::GetFlags() const
 {
-	return *reinterpret_cast<EObjectFlags*>(Field + Off::FField::Flags);
+	return RDeref<EObjectFlags>(Field + Off::FField::Flags);
 }
 
 class UEObject UEFField::GetOwnerAsUObject() const
@@ -81,9 +84,9 @@ class UEObject UEFField::GetOwnerAsUObject() const
 	if (IsOwnerUObject())
 	{
 		if (Settings::Internal::bUseMaskForFieldOwner)
-			return (void*)(*reinterpret_cast<uintptr_t*>(Field + Off::FField::Owner) & ~0x1ull);
+			return (void*)(RDeref<uintptr_t>(Field + Off::FField::Owner) & ~0x1ull);
 
-		return *reinterpret_cast<void**>(Field + Off::FField::Owner);
+		return RDeref<void*>(Field + Off::FField::Owner);
 	}
 
 	return nullptr;
@@ -92,7 +95,7 @@ class UEObject UEFField::GetOwnerAsUObject() const
 class UEFField UEFField::GetOwnerAsFField() const
 {
 	if (!IsOwnerUObject())
-		return *reinterpret_cast<void**>(Field + Off::FField::Owner);
+		return RDeref<void*>(Field + Off::FField::Owner);
 
 	return nullptr;
 }
@@ -111,7 +114,7 @@ class UEObject UEFField::GetOwnerUObject() const
 
 UEFFieldClass UEFField::GetClass() const
 {
-	return UEFFieldClass(*reinterpret_cast<void**>(Field + Off::FField::Class));
+	return UEFFieldClass(RDeref<void*>(Field + Off::FField::Class));
 }
 
 FName UEFField::GetFName() const
@@ -121,50 +124,29 @@ FName UEFField::GetFName() const
 
 UEFField UEFField::GetNext() const
 {
-	return UEFField(*reinterpret_cast<void**>(Field + Off::FField::Next));
+	return UEFField(RDeref<void*>(Field + Off::FField::Next));
 }
 
 std::vector<std::pair<std::string, std::string>> UEFField::GetMetaData() const
 {
-	using ValueType = std::conditional_t<sizeof(void*) == 0x8, int64, int32>;
+	// EditorOnlyMetadata is a TMap<FName, FString>* in the target. External-mode walks the
+	// map structure via RemoteContainers::ReadNameFStringMap (which internally walks
+	// TSparseArray + FBitArray to find active elements and bulk-reads each FString's
+	// wchar buffer). The keys are still remote addresses — we wrap them in FName so
+	// subsequent FName::ToString() goes through NameArray-backed remote reads.
+	const size_t keySize = (Off::InSDK::Name::FNameSize > 0x8) ? 0x10 : 0x8;
 
-	struct alignas(0x4) Name04Byte { uint8 Pad[0x04]; };
-	struct alignas(0x4) Name08Byte { uint8 Pad[0x08]; };
-	struct alignas(0x4) Name12Byte { uint8 Pad[0x0C]; };
-	struct alignas(0x4) Name16Byte { uint8 Pad[0x10]; };
-
-	static constexpr uintptr_t PointeFlagHasTag = 0x1;
-	static constexpr uintptr_t PointerMaskNoTag = ~0x1;
-
-
-	static auto GetPairsAsStrings = []<typename NameType>(const TMap<NameType, FString> &EnumNameValuePairs)
-	{
-		std::vector<std::pair<std::string, std::string>> Result;
-
-		for (const auto& [Key, Value] : EnumNameValuePairs)
-		{
-			Result.emplace_back(FName(&Key).ToString(), Value.ToString());
-		}
-
-		return Result;
-	};
-
-	if (Off::InSDK::Name::FNameSize > 0x8)
-	{
-		auto* Map = *reinterpret_cast<TMap<Name16Byte, FString>**>(Field + Off::FField::EditorOnlyMetadata);
-
-		if (!Map)
-			return {};
-
-		return GetPairsAsStrings(*Map);
-	}
-
-	auto* Map = *reinterpret_cast<TMap<Name08Byte, FString>**>(Field + Off::FField::EditorOnlyMetadata);
-
-	if (!Map)
+	const uintptr_t mapAddr = RDeref<uintptr_t>(Field + Off::FField::EditorOnlyMetadata);
+	if (mapAddr == 0)
 		return {};
 
-	return GetPairsAsStrings(*Map);
+	std::vector<std::pair<std::string, std::string>> Result;
+	for (const auto& entry : RemoteContainers::ReadNameFStringMap(mapAddr, keySize))
+	{
+		Result.emplace_back(FName(reinterpret_cast<const uint8*>(entry.KeyRemoteAddr)).ToString(),
+		                    entry.Value.ToString());
+	}
+	return Result;
 }
 
 template<typename UEType>
@@ -177,10 +159,10 @@ bool UEFField::IsOwnerUObject() const
 {
 	if (Settings::Internal::bUseMaskForFieldOwner)
 	{
-		return *reinterpret_cast<uintptr_t*>(Field + Off::FField::Owner) & 0x1;
+		return RDeref<uintptr_t>(Field + Off::FField::Owner) & 0x1;
 	}
 
-	return *reinterpret_cast<bool*>(Field + Off::FField::Owner + 0x8);
+	return RDeref<bool>(Field + Off::FField::Owner + 0x8);
 }
 
 bool UEFField::IsA(EClassCastFlags Flags) const
@@ -251,22 +233,22 @@ const void* UEObject::GetAddress() const
 
 void* UEObject::GetVft() const
 {
-	return *reinterpret_cast<void**>(Object);
+	return RDeref<void*>(Object);
 }
 
 EObjectFlags UEObject::GetFlags() const
 {
-	return *reinterpret_cast<EObjectFlags*>(Object + Off::UObject::Flags);
+	return RDeref<EObjectFlags>(Object + Off::UObject::Flags);
 }
 
 int32 UEObject::GetIndex() const
 {
-	return *reinterpret_cast<int32*>(Object + Off::UObject::Index);
+	return RDeref<int32>(Object + Off::UObject::Index);
 }
 
 UEClass UEObject::GetClass() const
 {
-	return UEClass(*reinterpret_cast<void**>(Object + Off::UObject::Class));
+	return UEClass(RDeref<void*>(Object + Off::UObject::Class));
 }
 
 FName UEObject::GetFName() const
@@ -276,7 +258,7 @@ FName UEObject::GetFName() const
 
 UEObject UEObject::GetOuter() const
 {
-	return UEObject(*reinterpret_cast<void**>(Object + Off::UObject::Outer));
+	return UEObject(RDeref<void*>(Object + Off::UObject::Outer));
 }
 
 int32 UEObject::GetPackageIndex() const
@@ -460,20 +442,19 @@ bool UEObject::operator!=(const UEObject& Other) const
 
 void UEObject::ProcessEvent(UEFunction Func, void* Params)
 {
-	void** VFT = *reinterpret_cast<void***>(GetAddress());
-
-#if defined(_WIN64)
-	void(*Prd)(void*, void*, void*) = decltype(Prd)(VFT[Off::InSDK::ProcessEvent::PEIndex]);
-#elif defined(_WIN32)
-	void(__thiscall* Prd)(void*, void*, void*) = decltype(Prd)(VFT[Off::InSDK::ProcessEvent::PEIndex]);
-#endif
-
-	Prd(Object, Func.GetAddress(), Params);
+	// In external mode the dumper cannot call into the target. Any call site that reaches
+	// this is a bug — the two places that historically used ProcessEvent (game name/version
+	// discovery in main.cpp and Conv_StringToText in InitTextOffsets) are now replaced with
+	// passive techniques in Phase 4. Leaving a loud diagnostic so any regression surfaces.
+	(void)Func;
+	(void)Params;
+	std::cerr << "[Dumper-7] UEObject::ProcessEvent invoked in external mode — this is a no-op "
+	             "and the caller should be reworked to avoid calling into the target.\n";
 }
 
 UEField UEField::GetNext() const
 {
-	return UEField(*reinterpret_cast<void**>(Object + Off::UField::Next));
+	return UEField(RDeref<void*>(Object + Off::UField::Next));
 }
 
 bool UEField::IsNextValid() const
@@ -483,122 +464,84 @@ bool UEField::IsNextValid() const
 
 std::vector<std::pair<FName, int64>> UEEnum::GetNameValuePairs() const
 {
-	using ValueType = std::conditional_t<sizeof(void*) == 0x8, int64, int32>;
+	// External-mode rewrite: instead of reinterpret_cast<TArray<...>*>(remoteAddr) + iteration,
+	// we walk the remote TArray via RemoteContainers::ReadNameValueTArray which bulk-reads the
+	// element storage and returns per-element {keyRemoteAddr, valueBytes} pairs. The FName
+	// wrappers are constructed from remote addresses so FName::ToString() drives through
+	// NameArray-backed hypercall reads.
+	static constexpr uintptr_t PointerMaskNoTag = ~uintptr_t{0x1};
 
-	struct alignas(0x4) Name04Byte { uint8 Pad[0x04]; };
-	struct alignas(0x4) Name08Byte { uint8 Pad[0x08]; };
-	struct alignas(0x4) Name12Byte { uint8 Pad[0x0C]; };
-	struct alignas(0x4) Name16Byte { uint8 Pad[0x10]; };
-	struct alignas(0x4) UInt8As64 { uint8 Bytes[sizeof(void*)]; inline operator int64() const { return Bytes[0]; }; };
+	const size_t keySize = Settings::Internal::bUseCasePreservingName ? 0x10 : 0x8;
 
-	static constexpr uintptr_t PointeFlagHasTag =  0x1;
-	static constexpr uintptr_t PointerMaskNoTag = ~0x1;
-
-	/*
-	 * For UEVersion >= UE5.6 
-	 * 
-	 * See: https://github.com/EpicGames/UnrealEngine/blob/ue5-main/Engine/Source/Runtime/CoreUObject/Public/UObject/Class.h#L3411
-	*/
-	static auto GetNameValuePairsForFNameData = [](const uintptr_t Object, const uint32_t EnumNamesOffset, const uint32_t FNameSize)
-	{
-		std::vector<std::pair<FName, int64>> Ret;
-
-		const uintptr_t TaggedNamesPtr = *reinterpret_cast<uintptr_t*>(Object + EnumNamesOffset);
-		const bool bIsNamesPtrTagged = (TaggedNamesPtr & PointeFlagHasTag) != 0;
-		const uint8* NamesPtr = reinterpret_cast<uint8*>(TaggedNamesPtr & PointerMaskNoTag);
-
-		if (!bIsNamesPtrTagged)
-		{
-			/* StaticNamesUTF8 is not supported yet. See: https://github.com/EpicGames/UnrealEngine/blob/ue5-main/Engine/Source/Runtime/CoreUObject/Public/UObject/Class.h#L3408*/
-			std::cerr << "Dumper-7 [UEEnum::GetNameValuePairs()]: UEnum::Names pointer is tagged! This is not supported yet!" << std::endl;
-			Sleep(100'000);
-			exit(1);
-		}
-
-		const int64* Values = reinterpret_cast<int64*>(*reinterpret_cast<uintptr_t*>(Object + EnumNamesOffset + 0x8) & PointerMaskNoTag);
-		const int32 NumValues = *reinterpret_cast<int32*>(Object + EnumNamesOffset + 0x10);
-
-		for (uint32_t i = 0; i < NumValues; i++)
-		{
-			Ret.push_back({ FName(NamesPtr + (i * FNameSize)), Values[i] });
-		}
-
-		return Ret;
-	};
-
+	// UE5.6+: FNameData layout. UEnum::Names - 8 points at a tagged pointer to Names.
 	if (Settings::Internal::bIsNewUE5EnumNamesContainer)
 	{
-		return GetNameValuePairsForFNameData(reinterpret_cast<const uintptr_t>(Object), Off::UEnum::Names - 0x8, Off::InSDK::Name::FNameSize);
+		std::vector<std::pair<FName, int64>> Ret;
+		const uintptr_t base = reinterpret_cast<uintptr_t>(Object) + Off::UEnum::Names - 0x8;
+
+		const uintptr_t taggedNamesPtr = RDeref<uintptr_t>(base);
+		const bool bIsNamesPtrTagged = (taggedNamesPtr & 0x1) != 0;
+		const uintptr_t namesPtr = taggedNamesPtr & PointerMaskNoTag;
+		if (!bIsNamesPtrTagged)
+		{
+			std::cerr << "Dumper-7 [UEEnum::GetNameValuePairs()]: UEnum::Names pointer is not tagged! StaticNamesUTF8 is not supported yet!" << std::endl;
+			return Ret;
+		}
+
+		const uintptr_t valuesPtr = RDeref<uintptr_t>(base + 0x8) & PointerMaskNoTag;
+		const int32 numValues = RDeref<int32>(base + 0x10);
+		if (numValues <= 0 || numValues > 0x10000)
+			return Ret;
+
+		const uint32_t fnameSize = Off::InSDK::Name::FNameSize;
+
+		// Bulk-read the int64 values buffer once.
+		std::vector<int64> values(numValues);
+		if (!RemoteMemory::ReadBuffer(valuesPtr, values.data(), numValues * sizeof(int64)))
+			return Ret;
+
+		Ret.reserve(numValues);
+		for (int32 i = 0; i < numValues; ++i)
+		{
+			const uintptr_t keyRemote = namesPtr + (static_cast<uintptr_t>(i) * fnameSize);
+			Ret.push_back({ FName(reinterpret_cast<const uint8*>(keyRemote)), values[i] });
+		}
+		return Ret;
 	}
 
+	const uintptr_t namesArrayAddr = reinterpret_cast<uintptr_t>(Object) + Off::UEnum::Names;
 
-	static auto GetNameValuePairsWithIndex = []<typename NameType, typename ValueType>(const TArray<TPair<NameType, ValueType>>&EnumNameValuePairs)
-	{
-		std::vector<std::pair<FName, int64>> Ret;
-
-		for (int i = 0; i < EnumNameValuePairs.Num(); i++)
-		{
-			Ret.push_back({ FName(&EnumNameValuePairs[i].First), EnumNameValuePairs[i].Second });
-		}
-
-		return Ret;
-	};
-
-	static auto GetNameValuePairs = []<typename NameType>(const TArray<NameType>&EnumNameValuePairs)
-	{
-		std::vector<std::pair<FName, int64>> Ret;
-
-		for (int i = 0; i < EnumNameValuePairs.Num(); i++)
-		{
-			Ret.push_back({ FName(&EnumNameValuePairs[i]), i });
-		}
-
-		return Ret;
-	};
-
-	if constexpr (Settings::EngineCore::bCheckEnumNamesInUEnum)
-	{
-		static auto SetIsNamesOnlyIfDevsTookCrack = [&]<typename NameType>(const TArray<TPair<NameType, UInt8As64>>&EnumNames)
-		{
-			/* This is a hacky workaround for UEnum::Names which sometimes store the enum-value and sometimes don't. I've seen much of UE, but what drugs did some devs take???? */
-			//Settings::Internal::bIsEnumNameOnly = EnumNames[0].Second != 0 || EnumNames[1].Second != 1;
-			// TODO (encryqed): Bruder was??? fix das mal iwi das geht nur durch hardcode idk frag fisch 
-			Settings::Internal::bIsEnumNameOnly = false;
-		};
-
-		if (Settings::Internal::bUseCasePreservingName)
-		{
-			SetIsNamesOnlyIfDevsTookCrack(*reinterpret_cast<TArray<TPair<Name16Byte, UInt8As64>>*>(Object + Off::UEnum::Names));
-		}
-		else
-		{
-			SetIsNamesOnlyIfDevsTookCrack(*reinterpret_cast<TArray<TPair<Name08Byte, UInt8As64>>*>(Object + Off::UEnum::Names));
-		}
-	}
-
+	// Fast path: plain TArray<NameNByte> (just names, indexed by position — older UE).
 	if (Settings::Internal::bIsEnumNameOnly)
 	{
-		if (Settings::Internal::bUseCasePreservingName)
-			return GetNameValuePairs(*reinterpret_cast<TArray<Name16Byte>*>(Object + Off::UEnum::Names));
+		std::vector<std::pair<FName, int64>> Ret;
+		const RemoteContainers::TArrayHeader header = RemoteContainers::ReadTArrayHeader(namesArrayAddr);
+		if (!header.IsValid())
+			return Ret;
 
-		return GetNameValuePairs(*reinterpret_cast<TArray<Name08Byte>*>(Object + Off::UEnum::Names));
-	}
-	else
-	{
-		/* This only applies very very rarely on weird UE4.13 or UE4.14 games where the devs didn't know what they were doing. */
-		if (Settings::Internal::bIsSmallEnumValue)
+		Ret.reserve(header.Num);
+		for (int32 i = 0; i < header.Num; ++i)
 		{
-			if (Settings::Internal::bUseCasePreservingName)
-				return GetNameValuePairsWithIndex(*reinterpret_cast<TArray<TPair<Name16Byte, UInt8As64>>*>(Object + Off::UEnum::Names));
-
-			return GetNameValuePairsWithIndex(*reinterpret_cast<TArray<TPair<Name08Byte, UInt8As64>>*>(Object + Off::UEnum::Names));
+			const uintptr_t keyRemote = header.Data + (static_cast<uintptr_t>(i) * keySize);
+			Ret.push_back({ FName(reinterpret_cast<const uint8*>(keyRemote)), static_cast<int64>(i) });
 		}
-
-		if (Settings::Internal::bUseCasePreservingName)
-			return GetNameValuePairsWithIndex(*reinterpret_cast<TArray<TPair<Name16Byte, int64>>*>(Object + Off::UEnum::Names));
-
-		return GetNameValuePairsWithIndex(*reinterpret_cast<TArray<TPair<Name08Byte, int64>>*>(Object + Off::UEnum::Names));
+		return Ret;
 	}
+
+	// TArray<TPair<NameNByte, int64>> or TArray<TPair<NameNByte, UInt8As64>> (small enum values).
+	const size_t valueSize = Settings::Internal::bIsSmallEnumValue ? sizeof(uint8) : sizeof(int64);
+
+	std::vector<std::pair<FName, int64>> Ret;
+	for (const auto& entry : RemoteContainers::ReadNameValueTArray(namesArrayAddr, keySize, valueSize))
+	{
+		int64 value = 0;
+		if (Settings::Internal::bIsSmallEnumValue)
+			value = static_cast<int64>(entry.ValueBytes & 0xFF);
+		else
+			value = static_cast<int64>(entry.ValueBytes);
+		Ret.push_back({ FName(reinterpret_cast<const uint8*>(entry.KeyRemoteAddr)), value });
+	}
+	return Ret;
 }
 
 std::string UEEnum::GetSingleName(int32 Index) const
@@ -620,27 +563,27 @@ std::string UEEnum::GetEnumTypeAsStr() const
 
 UEStruct UEStruct::GetSuper() const
 {
-	return UEStruct(*reinterpret_cast<void**>(Object + Off::UStruct::SuperStruct));
+	return UEStruct(RDeref<void*>(Object + Off::UStruct::SuperStruct));
 }
 
 UEField UEStruct::GetChild() const
 {
-	return UEField(*reinterpret_cast<void**>(Object + Off::UStruct::Children));
+	return UEField(RDeref<void*>(Object + Off::UStruct::Children));
 }
 
 UEFField UEStruct::GetChildProperties() const
 {
-	return UEFField(*reinterpret_cast<void**>(Object + Off::UStruct::ChildProperties));
+	return UEFField(RDeref<void*>(Object + Off::UStruct::ChildProperties));
 }
 
 int16 UEStruct::GetMinAlignment() const
 {
-	return *reinterpret_cast<int16*>(Object + Off::UStruct::MinAlignment);
+	return RDeref<int16>(Object + Off::UStruct::MinAlignment);
 }
 
 int32 UEStruct::GetStructSize() const
 {
-	return *reinterpret_cast<int32*>(Object + Off::UStruct::Size);
+	return RDeref<int32>(Object + Off::UStruct::Size);
 }
 
 bool UEStruct::HasType(UEStruct Type) const
@@ -747,7 +690,7 @@ bool UEStruct::HasMembers() const
 
 EClassCastFlags UEClass::GetCastFlags() const
 {
-	return *reinterpret_cast<EClassCastFlags*>(Object + Off::UClass::CastFlags);
+	return RDeref<EClassCastFlags>(Object + Off::UClass::CastFlags);
 }
 
 std::string UEClass::StringifyCastFlags() const
@@ -762,12 +705,16 @@ bool UEClass::IsType(EClassCastFlags TypeFlag) const
 
 UEObject UEClass::GetDefaultObject() const
 {
-	return UEObject(*reinterpret_cast<void**>(Object + Off::UClass::ClassDefaultObject));
+	return UEObject(RDeref<void*>(Object + Off::UClass::ClassDefaultObject));
 }
 
 TArray<FImplementedInterface> UEClass::GetImplementedInterfaces() const
 {
-	return *reinterpret_cast<TArray<FImplementedInterface>*>(Object + Off::UClass::ImplementedInterfaces);
+	// This method isn't actually called by the dumper itself — only OffsetFinder probes the
+	// layout via its own reinterpret_cast. If a future caller needs the array contents in
+	// external mode, wrap this with RemoteContainers; today it just reads the TArray header
+	// as raw bytes. Data* inside the returned TArray is a remote VA; do not dereference.
+	return RDeref<TArray<FImplementedInterface>>(Object + Off::UClass::ImplementedInterfaces);
 }
 
 UEFunction UEClass::GetFunction(const std::string& ClassName, const std::string& FuncName) const
@@ -792,7 +739,7 @@ UEFunction UEClass::GetFunction(const std::string& ClassName, const std::string&
 
 EFunctionFlags UEFunction::GetFunctionFlags() const
 {
-	return *reinterpret_cast<EFunctionFlags*>(Object + Off::UFunction::FunctionFlags);
+	return RDeref<EFunctionFlags>(Object + Off::UFunction::FunctionFlags);
 }
 
 bool UEFunction::HasFlags(EFunctionFlags FuncFlags) const
@@ -802,7 +749,7 @@ bool UEFunction::HasFlags(EFunctionFlags FuncFlags) const
 
 void* UEFunction::GetExecFunction() const
 {
-	return *reinterpret_cast<void**>(Object + Off::UFunction::ExecFunction);
+	return RDeref<void*>(Object + Off::UFunction::ExecFunction);
 }
 
 UEProperty UEFunction::GetReturnProperty() const
@@ -879,24 +826,24 @@ FName UEProperty::GetFName() const
 int32 UEProperty::GetArrayDim() const
 {
 	if (Settings::Internal::bUseUint8ArrayDim)
-		return *reinterpret_cast<uint8*>(Base + Off::Property::ArrayDim);
+		return RDeref<uint8>(Base + Off::Property::ArrayDim);
 
-	return *reinterpret_cast<int32*>(Base + Off::Property::ArrayDim);
+	return RDeref<int32>(Base + Off::Property::ArrayDim);
 }
 
 int32 UEProperty::GetSize() const
 {
-	return *reinterpret_cast<int32*>(Base + Off::Property::ElementSize);
+	return RDeref<int32>(Base + Off::Property::ElementSize);
 }
 
 int32 UEProperty::GetOffset() const
 {
-	return *reinterpret_cast<int32*>(Base + Off::Property::Offset_Internal);
+	return RDeref<int32>(Base + Off::Property::Offset_Internal);
 }
 
 EPropertyFlags UEProperty::GetPropertyFlags() const
 {
-	return *reinterpret_cast<EPropertyFlags*>(Base + Off::Property::PropertyFlags);
+	return RDeref<EPropertyFlags>(Base + Off::Property::PropertyFlags);
 }
 
 bool UEProperty::HasPropertyFlags(EPropertyFlags PropertyFlag) const
@@ -1237,7 +1184,7 @@ std::string UEProperty::StringifyFlags() const
 
 UEEnum UEByteProperty::GetEnum() const
 {
-	return UEEnum(*reinterpret_cast<void**>(Base + Off::ByteProperty::Enum));
+	return UEEnum(RDeref<void*>(Base + Off::ByteProperty::Enum));
 }
 
 std::string UEByteProperty::GetCppType() const
@@ -1252,12 +1199,12 @@ std::string UEByteProperty::GetCppType() const
 
 uint8 UEBoolProperty::GetFieldMask() const
 {
-	return reinterpret_cast<Off::BoolProperty::UBoolPropertyBase*>(Base + Off::BoolProperty::Base)->FieldMask;
+	return RDeref<Off::BoolProperty::UBoolPropertyBase>(Base + Off::BoolProperty::Base).FieldMask;
 }
 
 uint8 UEBoolProperty::GetByteOffset() const
 {
-	return reinterpret_cast<Off::BoolProperty::UBoolPropertyBase*>(Base + Off::BoolProperty::Base)->ByteOffset;
+	return RDeref<Off::BoolProperty::UBoolPropertyBase>(Base + Off::BoolProperty::Base).ByteOffset;
 }
 
 uint8 UEBoolProperty::GetBitIndex() const
@@ -1283,7 +1230,7 @@ uint8 UEBoolProperty::GetBitIndex() const
 
 bool UEBoolProperty::IsNativeBool() const
 {
-	return reinterpret_cast<Off::BoolProperty::UBoolPropertyBase*>(Base + Off::BoolProperty::Base)->FieldMask == 0xFF;
+	return RDeref<Off::BoolProperty::UBoolPropertyBase>(Base + Off::BoolProperty::Base).FieldMask == 0xFF;
 }
 
 std::string UEBoolProperty::GetCppType() const
@@ -1293,7 +1240,7 @@ std::string UEBoolProperty::GetCppType() const
 
 UEClass UEObjectProperty::GetPropertyClass() const
 {
-	return UEClass(*reinterpret_cast<void**>(Base + Off::ObjectProperty::PropertyClass));
+	return UEClass(RDeref<void*>(Base + Off::ObjectProperty::PropertyClass));
 }
 
 std::string UEObjectProperty::GetCppType() const
@@ -1303,7 +1250,7 @@ std::string UEObjectProperty::GetCppType() const
 
 UEClass UEClassProperty::GetMetaClass() const
 {
-	return UEClass(*reinterpret_cast<void**>(Base + Off::ClassProperty::MetaClass));
+	return UEClass(RDeref<void*>(Base + Off::ClassProperty::MetaClass));
 }
 
 std::string UEClassProperty::GetCppType() const
@@ -1338,7 +1285,7 @@ std::string UEInterfaceProperty::GetCppType() const
 
 UEStruct UEStructProperty::GetUnderlayingStruct() const
 {
-	return UEStruct(*reinterpret_cast<void**>(Base + Off::StructProperty::Struct));
+	return UEStruct(RDeref<void*>(Base + Off::StructProperty::Struct));
 }
 
 std::string UEStructProperty::GetCppType() const
@@ -1348,7 +1295,7 @@ std::string UEStructProperty::GetCppType() const
 
 UEProperty UEArrayProperty::GetInnerProperty() const
 {
-	return UEProperty(*reinterpret_cast<void**>(Base + Off::ArrayProperty::Inner));
+	return UEProperty(RDeref<void*>(Base + Off::ArrayProperty::Inner));
 }
 
 std::string UEArrayProperty::GetCppType() const
@@ -1358,7 +1305,7 @@ std::string UEArrayProperty::GetCppType() const
 
 UEFunction UEDelegateProperty::GetSignatureFunction() const
 {
-	return UEFunction(*reinterpret_cast<void**>(Base + Off::DelegateProperty::SignatureFunction));
+	return UEFunction(RDeref<void*>(Base + Off::DelegateProperty::SignatureFunction));
 }
 
 std::string UEDelegateProperty::GetCppType() const
@@ -1369,7 +1316,7 @@ std::string UEDelegateProperty::GetCppType() const
 UEFunction UEMulticastInlineDelegateProperty::GetSignatureFunction() const
 {
 	// Uses "Off::DelegateProperty::SignatureFunction" on purpose
-	return UEFunction(*reinterpret_cast<void**>(Base + Off::DelegateProperty::SignatureFunction));
+	return UEFunction(RDeref<void*>(Base + Off::DelegateProperty::SignatureFunction));
 }
 
 std::string UEMulticastInlineDelegateProperty::GetCppType() const
@@ -1379,12 +1326,12 @@ std::string UEMulticastInlineDelegateProperty::GetCppType() const
 
 UEProperty UEMapProperty::GetKeyProperty() const
 {
-	return UEProperty(reinterpret_cast<Off::MapProperty::UMapPropertyBase*>(Base + Off::MapProperty::Base)->KeyProperty);
+	return UEProperty(RDeref<Off::MapProperty::UMapPropertyBase>(Base + Off::MapProperty::Base).KeyProperty);
 }
 
 UEProperty UEMapProperty::GetValueProperty() const
 {
-	return UEProperty(reinterpret_cast<Off::MapProperty::UMapPropertyBase*>(Base + Off::MapProperty::Base)->ValueProperty);
+	return UEProperty(RDeref<Off::MapProperty::UMapPropertyBase>(Base + Off::MapProperty::Base).ValueProperty);
 }
 
 std::string UEMapProperty::GetCppType() const
@@ -1394,7 +1341,7 @@ std::string UEMapProperty::GetCppType() const
 
 UEProperty UESetProperty::GetElementProperty() const
 {
-	return UEProperty(*reinterpret_cast<void**>(Base + Off::SetProperty::ElementProp));
+	return UEProperty(RDeref<void*>(Base + Off::SetProperty::ElementProp));
 }
 
 std::string UESetProperty::GetCppType() const
@@ -1404,12 +1351,12 @@ std::string UESetProperty::GetCppType() const
 
 UEProperty UEEnumProperty::GetUnderlayingProperty() const
 {
-	return UEProperty(reinterpret_cast<Off::EnumProperty::UEnumPropertyBase*>(Base + Off::EnumProperty::Base)->UnderlayingProperty);
+	return UEProperty(RDeref<Off::EnumProperty::UEnumPropertyBase>(Base + Off::EnumProperty::Base).UnderlayingProperty);
 }
 
 UEEnum UEEnumProperty::GetEnum() const
 {
-	return UEEnum(reinterpret_cast<Off::EnumProperty::UEnumPropertyBase*>(Base + Off::EnumProperty::Base)->Enum);
+	return UEEnum(RDeref<Off::EnumProperty::UEnumPropertyBase>(Base + Off::EnumProperty::Base).Enum);
 }
 
 std::string UEEnumProperty::GetCppType() const
@@ -1422,7 +1369,7 @@ std::string UEEnumProperty::GetCppType() const
 
 UEFFieldClass UEFieldPathProperty::GetFieldClass() const
 {
-	return UEFFieldClass(*reinterpret_cast<void**>(Base + Off::FieldPathProperty::FieldClass));
+	return UEFFieldClass(RDeref<void*>(Base + Off::FieldPathProperty::FieldClass));
 }
 
 std::string UEFieldPathProperty::GetCppType() const
@@ -1432,7 +1379,7 @@ std::string UEFieldPathProperty::GetCppType() const
 
 UEProperty UEOptionalProperty::GetValueProperty() const
 {
-	return UEProperty(*reinterpret_cast<void**>(Base + Off::OptionalProperty::ValueProperty));
+	return UEProperty(RDeref<void*>(Base + Off::OptionalProperty::ValueProperty));
 }
 
 std::string UEOptionalProperty::GetCppType() const

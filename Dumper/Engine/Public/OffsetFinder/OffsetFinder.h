@@ -5,6 +5,7 @@
 #include "Unreal/ObjectArray.h"
 
 #include "Platform.h"
+#include "RemoteMemory.h"
 
 namespace OffsetFinder
 {
@@ -27,7 +28,7 @@ namespace OffsetFinder
 
 			for (int j = HighestFoundOffset; j < MaxOffset; j += Alignement)
 			{
-				const T TypedValueAtOffset = *reinterpret_cast<T*>(static_cast<uint8_t*>(ObjectValuePair[i].first) + j);
+				const T TypedValueAtOffset = RDeref<T>(static_cast<uint8_t*>(ObjectValuePair[i].first) + j);
 
 				if (TypedValueAtOffset == ObjectValuePair[i].second && j >= HighestFoundOffset)
 				{
@@ -43,7 +44,6 @@ namespace OffsetFinder
 			}
 		}
 
-		//return HighestFoundOffset != MinOffset ? HighestFoundOffset : OffsetNotFound;
 		return bFoundOffset ? HighestFoundOffset : OffsetNotFound;
 	}
 
@@ -58,12 +58,17 @@ namespace OffsetFinder
 
 		for (int j = StartingOffset; j <= MaxOffset; j += sizeof(void*))
 		{
-			const bool bIsAValid = !Platform::IsBadReadPtr(*reinterpret_cast<void* const*>(ObjA + j)) && (bCheckForVft ? !Platform::IsBadReadPtr(**reinterpret_cast<void** const*>(ObjA + j)) : true);
-			const bool bIsBValid = !Platform::IsBadReadPtr(*reinterpret_cast<void* const*>(ObjB + j)) && (bCheckForVft ? !Platform::IsBadReadPtr(**reinterpret_cast<void** const*>(ObjB + j)) : true);
+			const uintptr_t ptrAtA = RDeref<uintptr_t>(ObjA + j);
+			const uintptr_t ptrAtB = RDeref<uintptr_t>(ObjB + j);
+
+			const bool bIsAValid = !Platform::IsBadReadPtr(ptrAtA)
+				&& (bCheckForVft ? !Platform::IsBadReadPtr(RDeref<uintptr_t>(ptrAtA)) : true);
+			const bool bIsBValid = !Platform::IsBadReadPtr(ptrAtB)
+				&& (bCheckForVft ? !Platform::IsBadReadPtr(RDeref<uintptr_t>(ptrAtB)) : true);
 
 			if (bNeedsToBeInProcessMemory)
 			{
-				if (!Platform::IsAddressInProcessRange(*reinterpret_cast<void* const*>(ObjA + j)) || !Platform::IsAddressInProcessRange(*reinterpret_cast<void* const*>(ObjB + j)))
+				if (!Platform::IsAddressInProcessRange(ptrAtA) || !Platform::IsAddressInProcessRange(ptrAtB))
 					continue;
 			}
 

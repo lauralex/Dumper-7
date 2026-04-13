@@ -10,19 +10,30 @@ if(CMAKE_GENERATOR MATCHES "Ninja")
     message(STATUS "Using Ninja generator - platform specification disabled")
 endif()
 
-project(Dumper-7 LANGUAGES CXX C)
+project(Dumper-7 LANGUAGES CXX C ASM_MASM)
 
 include(${CMAKE_SOURCE_DIR}/cmake/common.cmake)
 
 # Source files - automatic search for all source files
-file(GLOB_RECURSE CPP_SOURCES 
+file(GLOB_RECURSE CPP_SOURCES
     "Dumper/*.cpp"
     "Dumper/*.cxx"
     "Dumper/*.cc"
     "Dumper/*.c"
 )
 
-add_library(${PROJECT_NAME} SHARED ${CPP_SOURCES})
+set(ASM_SOURCES
+    "Dumper/Memory/Private/hv.asm"
+)
+
+add_executable(${PROJECT_NAME} ${CPP_SOURCES} ${ASM_SOURCES})
+
+# HvProbe.cpp wraps an SEH __try/__except around hv::ping() to catch the #UD fault
+# raised when no hypervisor is installed. SEH filters in C++ require /EHa.
+set_source_files_properties(
+    "Dumper/Memory/Private/HvProbe.cpp"
+    PROPERTIES COMPILE_OPTIONS "/EHa"
+)
 
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 
@@ -30,6 +41,10 @@ target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_20)
 target_include_directories(${PROJECT_NAME} PRIVATE
 # Dumper
     ${CMAKE_SOURCE_DIR}/Dumper
+
+    # Memory
+    ${CMAKE_SOURCE_DIR}/Dumper/Memory/Public
+    ${CMAKE_SOURCE_DIR}/Dumper/Memory/Private
 
     # Engine
     ${CMAKE_SOURCE_DIR}/Dumper/Engine
@@ -80,6 +95,5 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 
 # Set Windows subsystem
 set_target_properties(${PROJECT_NAME} PROPERTIES
-    WINDOWS_EXPORT_ALL_SYMBOLS ON
     VS_GLOBAL_KEYWORD "Win32Proj"
-) 
+)

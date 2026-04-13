@@ -8,6 +8,8 @@
 
 #include "Architecture.h"
 
+#include "RemoteMemory.h"
+
 
 std::string MakeNameValid(std::wstring&& Name)
 {
@@ -69,6 +71,14 @@ FName::FName(const void* Ptr)
 void FName::Init_Windows(bool bForceGNames)
 {
 #ifdef PLATFORM_WINDOWS
+
+	// External mode cannot call target function pointers (AppendString, GetNames). Force the
+	// GNames-backed ToStr path unconditionally so every FName::ToString read comes from the
+	// NameArray hypercall path. The pattern scanners below still run (their output is emitted
+	// into the generated SDK for the consumer to use), but the dumper itself never invokes
+	// any discovered function pointer.
+	bForceGNames = true;
+
 
 #if defined(_WIN64)
 	constexpr std::array<const char*, 6> PossibleSigs = 
@@ -356,9 +366,9 @@ std::string FName::ToValidString() const
 	return MakeNameValid(ToWString());
 }
 
-int32 FName::GetCompIdx() const 
+int32 FName::GetCompIdx() const
 {
-	return *reinterpret_cast<const int32*>(Address + Off::FName::CompIdx);
+	return RDeref<int32>(Address + Off::FName::CompIdx);
 }
 
 uint32 FName::GetNumber() const
@@ -367,9 +377,9 @@ uint32 FName::GetNumber() const
 		return 0x0;
 
 	if (Settings::Internal::bUseNamePool)
-		return *reinterpret_cast<const uint32*>(Address + Off::FName::Number); // The number is uint32 on versions <= UE4.23 
+		return RDeref<uint32>(Address + Off::FName::Number); // The number is uint32 on versions <= UE4.23
 
-	return static_cast<uint32_t>(*reinterpret_cast<const int32*>(Address + Off::FName::Number));
+	return static_cast<uint32_t>(RDeref<int32>(Address + Off::FName::Number));
 }
 
 bool FName::operator==(FName Other) const

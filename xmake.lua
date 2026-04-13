@@ -3,13 +3,19 @@ add_rules("mode.debug", "mode.release")
 set_languages("c++latest", "clatest")
 
 target("Dumper-7")
-    set_kind("shared")
+    set_kind("binary")
 
     add_files("Dumper/**.cpp")
     add_files("Dumper/**.c")
+    add_files("Dumper/Memory/Private/hv.asm")
+
+    -- HvProbe.cpp uses SEH __try/__except in C++ to catch the #UD from vmcall when
+    -- no hypervisor is installed. SEH filters in C++ require /EHa.
+    add_files("Dumper/Memory/Private/HvProbe.cpp", {cxflags = "/EHa", override = true})
 
     add_includedirs("Dumper", {public = true})
     add_includedirs("Dumper/Utils", {public = true})
+    add_includedirs("Dumper/Memory/Public", {public = true})
     add_includedirs("Dumper/Engine/Public", {public = true})
     add_includedirs("Dumper/Generator/Public", {public = true})
     add_includedirs("Dumper/Platform/Public", {public = true})

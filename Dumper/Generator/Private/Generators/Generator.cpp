@@ -42,38 +42,48 @@ void Generator::InitEngineCore()
 	/* Multiversus [Unsupported, weird GObjects-struct] */
 	//InitObjectArrayDecryption([](void* ObjPtr) -> uint8* { return reinterpret_cast<uint8*>(uint64(ObjPtr) ^ 0x1B5DEAFD6B4068C); });
 
+	std::cerr << "[InitEngineCore] ObjectArray::Init\n";
 	ObjectArray::Init();
 
+	std::cerr << "[InitEngineCore] FName::Init\n";
 	CALL_PLATFORM_SPECIFIC_FUNCTION(FName::Init);
 
+	std::cerr << "[InitEngineCore] Off::Init\n";
 	Off::Init();
+	std::cerr << "[InitEngineCore] PropertySizes::Init\n";
 	PropertySizes::Init();
 
-	CALL_PLATFORM_SPECIFIC_FUNCTION(Off::InSDK::ProcessEvent::InitPE); // Must be at this position, relies on offsets initialized in Off::Init()
+	std::cerr << "[InitEngineCore] InitPE\n";
+	CALL_PLATFORM_SPECIFIC_FUNCTION(Off::InSDK::ProcessEvent::InitPE);
 
-	Off::InSDK::World::InitGWorld(); // Must be at this position, relies on offsets initialized in Off::Init()
+	std::cerr << "[InitEngineCore] InitGWorld\n";
+	Off::InSDK::World::InitGWorld();
 
-	Off::InSDK::Text::InitTextOffsets(); // Must be at this position, relies on offsets initialized in Off::InitPE()
+	std::cerr << "[InitEngineCore] InitTextOffsets\n";
+	Off::InSDK::Text::InitTextOffsets();
 
+	std::cerr << "[InitEngineCore] InitSettings\n";
 	InitSettings();
+	std::cerr << "[InitEngineCore] done\n";
 }
 
 void Generator::InitInternal()
 {
-	// Initialize PackageManager with all packages, their names, structs, classes enums, functions and dependencies
+	std::cerr << "[InitInternal] PackageManager::Init\n";
 	PackageManager::Init();
 
-	// Initialize StructManager with all structs and their names
+	std::cerr << "[InitInternal] StructManager::Init\n";
 	StructManager::Init();
-	
-	// Initialize EnumManager with all enums and their names
+
+	std::cerr << "[InitInternal] EnumManager::Init\n";
 	EnumManager::Init();
-	
-	// Initialized all Member-Name collisions
+
+	std::cerr << "[InitInternal] MemberManager::Init\n";
 	MemberManager::Init();
 
-	// Post-Initialize PackageManager after StructManager has been initialized. 'PostInit()' handles Cyclic-Dependencies detection
+	std::cerr << "[InitInternal] PackageManager::PostInit\n";
 	PackageManager::PostInit();
+	std::cerr << "[InitInternal] done\n";
 }
 
 bool Generator::SetupDumperFolder()

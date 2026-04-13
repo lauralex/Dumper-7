@@ -10,13 +10,17 @@
 
 #include "Platform.h"
 #include "Architecture.h"
+#include "RemoteMemory.h"
 
 
 void Off::InSDK::ProcessEvent::InitPE_Windows()
 {
 #ifdef PLATFORM_WINDOWS
 
-	void** Vft = *(void***)ObjectArray::GetByIndex(0).GetAddress();
+	// Read the vtable pointer from object 0 via hypercall; then cast to void** so
+	// IterateVTableFunctions can treat it as a remote VA of the vtable table.
+	const uintptr_t Obj0Addr = reinterpret_cast<uintptr_t>(ObjectArray::GetByIndex(0).GetAddress());
+	void** Vft = reinterpret_cast<void**>(RDeref<uintptr_t>(Obj0Addr));
 
 #if defined(_WIN64)
 	/* Primary, and more reliable, check for ProcessEvent */
@@ -77,9 +81,13 @@ void Off::InSDK::ProcessEvent::InitPE(const int32 Index, const char* const Modul
 {
 	Off::InSDK::ProcessEvent::PEIndex = Index;
 
-	void** VFT = *reinterpret_cast<void***>(ObjectArray::GetByIndex(0).GetAddress());
+	// Read the vtable pointer of object 0, then read the Index-th function pointer from it.
+	// Both reads go through RemoteMemory in external mode.
+	const uintptr_t objectAddr = reinterpret_cast<uintptr_t>(ObjectArray::GetByIndex(0).GetAddress());
+	const uintptr_t vftAddr = RDeref<uintptr_t>(objectAddr);
+	const uintptr_t peFuncAddr = RDeref<uintptr_t>(vftAddr + Off::InSDK::ProcessEvent::PEIndex * sizeof(void*));
 
-	Off::InSDK::ProcessEvent::PEOffset = Platform::GetOffset(VFT[Off::InSDK::ProcessEvent::PEIndex], ModuleName);
+	Off::InSDK::ProcessEvent::PEOffset = Platform::GetOffset(peFuncAddr, ModuleName);
 
 	std::cerr << std::format("PE-Offset: 0x{:X}\n", Off::InSDK::ProcessEvent::PEOffset);
 }
@@ -106,14 +114,14 @@ void Off::InSDK::World::InitGWorld()
 			}
 			else if (Results.size() == 2)
 			{
-				auto ObjAddress = reinterpret_cast<uintptr_t>(Obj.GetAddress());
-				auto PossibleGWorld = reinterpret_cast<volatile uintptr_t*>(Results[0]);
-				auto CurrentValue = *PossibleGWorld;
+				const uintptr_t ObjAddress = reinterpret_cast<uintptr_t>(Obj.GetAddress());
+				const uintptr_t PossibleGWorld = reinterpret_cast<uintptr_t>(Results[0]);
+				uintptr_t CurrentValue = RDeref<uintptr_t>(PossibleGWorld);
 
 				for (int i = 0; CurrentValue == ObjAddress && i < 50; ++i)
 				{
 					::Sleep(1);
-					CurrentValue = *PossibleGWorld;
+					CurrentValue = RDeref<uintptr_t>(PossibleGWorld);
 				}
 				if (CurrentValue == ObjAddress)
 				{
@@ -122,7 +130,7 @@ void Off::InSDK::World::InitGWorld()
 				else
 				{
 					Result = Results[1];
-					std::cerr << std::format("Filter GActiveLogWorld at 0x{:X}\n\n", reinterpret_cast<uintptr_t>(PossibleGWorld));
+					std::cerr << std::format("Filter GActiveLogWorld at 0x{:X}\n\n", PossibleGWorld);
 				}
 			}
 			else
@@ -147,107 +155,42 @@ void Off::InSDK::World::InitGWorld()
 /* FText */
 void Off::InSDK::Text::InitTextOffsets()
 {
-	if (!Off::InSDK::ProcessEvent::PEIndex)
-	{
-		std::cerr << std::format("\nDumper-7: Error, 'InitInSDKTextOffsets' was called before ProcessEvent was initialized!\n") << std::endl;
-		return;
-	}
-
-	auto IsValidPtr = [](void* a) -> bool
-	{
-		return !Platform::IsBadReadPtr(a) /* && (uintptr_t(a) & 0x1) == 0*/; // realistically, there wont be any pointers to unaligned memory
-	};
-
+	// The injected-mode path called Conv_StringToText via ProcessEvent and then looked at
+	// where the resulting FText stored the string. External mode cannot call into the target,
+	// so we use a hardcoded layout that matches UE4.27 / UE5.0+ FText: the FTextData* lives at
+	// the top of the FText, and the wide-char buffer is a subobject of FTextData whose
+	// FString::Data pointer sits at offset 0x30 from the start of FTextData.
+	//
+	// Games on exotic UE versions (Fortnite and a few UE5 forks have a different FText shape)
+	// will need a manual override via Settings::EngineCore::FTextLayoutOverride. The plan's
+	// v1 fallback is a disassembly-based auto-discovery of Conv_StringToText's body; that is
+	// deferred until parity-diff runs show whether the hardcoded defaults are accurate enough.
 
 	const UEFunction Conv_StringToText = ObjectArray::FindObjectFast<UEFunction>("Conv_StringToText", EClassCastFlags::Function);
-
-	UEProperty InStringProp = nullptr;
-	UEProperty ReturnProp = nullptr;
-
-	if (!Conv_StringToText)
+	if (Conv_StringToText)
 	{
-		std::cerr << "Conv_StringToText is invalid!\n";
-		return;
-	}
-
-	for (UEProperty Prop : Conv_StringToText.GetProperties())
-	{
-		/* Func has 2 params, if the param is the return value assign to ReturnProp, else InStringProp*/
-		if (Prop.HasPropertyFlags(EPropertyFlags::ReturnParm))
+		UEProperty ReturnProp = nullptr;
+		for (UEProperty Prop : Conv_StringToText.GetProperties())
 		{
-			ReturnProp = Prop;
+			if (Prop.HasPropertyFlags(EPropertyFlags::ReturnParm))
+			{
+				ReturnProp = Prop;
+				break;
+			}
 		}
-		else
-		{
-			InStringProp = Prop;
-		}
+		if (ReturnProp)
+			Off::InSDK::Text::TextSize = ReturnProp.GetSize();
 	}
 
-	const int32 ParamSize = Conv_StringToText.GetStructSize();
-	const int32 FTextSize = ReturnProp.GetSize();
+	if (Off::InSDK::Text::TextSize == 0)
+		Off::InSDK::Text::TextSize = 0x18; // Standard FText size on UE4.27 / UE5
 
-	const int32 StringOffset = InStringProp.GetOffset();
-	const int32 ReturnValueOffset = ReturnProp.GetOffset();
-
-	Off::InSDK::Text::TextSize = FTextSize;
-
-
-	/* Allocate and zero-initialize ParamStruct */
-#pragma warning(disable: 6255)
-	uint8_t* ParamPtr = static_cast<uint8_t*>(alloca(ParamSize));
-	memset(ParamPtr, 0, ParamSize);
-
-	/* Choose a, fairly random, string to later search for in FTextData */
-	constexpr const wchar_t* StringText = L"ThisIsAGoodString!";
-	constexpr int32 StringLength = (sizeof(L"ThisIsAGoodString!") / sizeof(wchar_t));
-	constexpr int32 StringLengthBytes = (sizeof(L"ThisIsAGoodString!"));
-
-	/* Initialize 'InString' in the ParamStruct */
-	*reinterpret_cast<FString*>(ParamPtr + StringOffset) = StringText;
-
-	/* This function is 'static' so the object on which we call it doesn't matter */
-	ObjectArray::GetByIndex(0).ProcessEvent(Conv_StringToText, ParamPtr);
-
-	uint8_t* FTextDataPtr = nullptr;
-
-	/* Search for the first valid pointer inside of the FText and make the offset our 'TextDatOffset' */
-	for (int32 i = 0; i < (FTextSize - sizeof(void*)); i += sizeof(void*))
-	{
-		void* PossibleTextDataPtr = *reinterpret_cast<void**>(ParamPtr + ReturnValueOffset + i);
-
-		if (IsValidPtr(PossibleTextDataPtr))
-		{
-			FTextDataPtr = static_cast<uint8_t*>(PossibleTextDataPtr);
-			Off::InSDK::Text::TextDatOffset = i;
-			break;
-		}
-	}
-
-	if (!FTextDataPtr)
-	{
-		std::cerr << std::format("\nDumper-7: Error, 'FTextDataPtr' could not be found!\n") << std::endl;
-		return;
-	}
-
-	constexpr int32 MaxOffset = 0x50;
-	constexpr int32 StartOffset = sizeof(void*); // FString::NumElements offset
-
-	/* Search for a pointer pointing to a int32 Value (FString::NumElements) equal to StringLength */
-	for (int32 i = StartOffset; i < MaxOffset; i += sizeof(int32))
-	{
-		wchar_t* PosibleStringPtr = *reinterpret_cast<wchar_t**>((FTextDataPtr + i) - sizeof(void*));
-		const int32 PossibleLength = *reinterpret_cast<int32*>(FTextDataPtr + i);
-
-		if (PossibleLength == StringLength && PosibleStringPtr && IsValidPtr(PosibleStringPtr) && memcmp(StringText, PosibleStringPtr, StringLengthBytes) == 0)
-		{
-			Off::InSDK::Text::InTextDataStringOffset = (i - sizeof(void*));
-			break;
-		}
-	}
+	Off::InSDK::Text::TextDatOffset = 0x0;
+	Off::InSDK::Text::InTextDataStringOffset = 0x30;
 
 	std::cerr << std::format("Off::InSDK::Text::TextSize: 0x{:X}\n", Off::InSDK::Text::TextSize);
-	std::cerr << std::format("Off::InSDK::Text::TextDatOffset: 0x{:X}\n", Off::InSDK::Text::TextDatOffset);
-	std::cerr << std::format("Off::InSDK::Text::InTextDataStringOffset: 0x{:X}\n\n", Off::InSDK::Text::InTextDataStringOffset);
+	std::cerr << std::format("Off::InSDK::Text::TextDatOffset: 0x{:X} (hardcoded UE4.27/UE5 default)\n", Off::InSDK::Text::TextDatOffset);
+	std::cerr << std::format("Off::InSDK::Text::InTextDataStringOffset: 0x{:X} (hardcoded UE4.27/UE5 default)\n\n", Off::InSDK::Text::InTextDataStringOffset);
 }
 
 void Off::Init()
@@ -273,14 +216,15 @@ void Off::Init()
 	OverwriteIfInvalidOffset(Off::UObject::Class, (Off::UObject::Index + sizeof(int32))); // Default to right after Index
 	std::cerr << std::format("Off::UObject::Class: 0x{:X}\n", Off::UObject::Class);
 
-	Off::UObject::Outer = OffsetFinder::FindUObjectOuterOffset();
-	std::cerr << std::format("Off::UObject::Outer: 0x{:X}\n", Off::UObject::Outer);
-
+	// Find Name before Outer so the statistical FName scan isn't blocked by an
+	// (not yet known) Outer exclusion, and so the Outer scan can start after Name.
 	Off::UObject::Name = OffsetFinder::FindUObjectNameOffset();
 	OverwriteIfInvalidOffset(Off::UObject::Name, (Off::UObject::Class + sizeof(void*))); // Default to right after Class
-	std::cerr << std::format("Off::UObject::Name: 0x{:X}\n\n", Off::UObject::Name);
+	std::cerr << std::format("Off::UObject::Name: 0x{:X}\n", Off::UObject::Name);
 
+	Off::UObject::Outer = OffsetFinder::FindUObjectOuterOffset();
 	OverwriteIfInvalidOffset(Off::UObject::Outer, (Off::UObject::Name + sizeof(int32) + sizeof(int32)));  // Default to right after Name
+	std::cerr << std::format("Off::UObject::Outer: 0x{:X}\n\n", Off::UObject::Outer);
 
 	OffsetFinder::InitFNameSettings();
 
