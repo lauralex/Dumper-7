@@ -817,6 +817,13 @@ bool PlatformWindows::IsAddressInProcessRange(const void* Address)
 
 bool PlatformWindows::IsBadReadPtr(const uintptr_t Address)
 {
+	// Guard null and low addresses explicitly. Some hv implementations treat src=0 as a
+	// no-op success, making IsValid(0) return true erroneously; combined with unsigned
+	// offset math this was causing offset-finders to accept a 0 as "valid pointer" and
+	// derive nonsensical follow-on offsets. No legitimate user-space pointer we'd ever
+	// follow lives below the first user page (4 KB).
+	if (Address < 0x1000)
+		return true;
 	if constexpr (!Is32Bit())
 	{
 		if (!Architecture_x86_64::IsValid64BitVirtualAddress(reinterpret_cast<const void*>(Address)))
