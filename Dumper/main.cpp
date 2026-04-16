@@ -195,14 +195,31 @@ int main(int argc, char** argv)
 	std::cerr << "GameName:    " << Settings::Generator::GameName << "\n";
 	std::cerr << "GameVersion: " << Settings::Generator::GameVersion << "\n\n";
 
-	std::cerr << "[main] -> Generate<CppGenerator>\n";
-	Generator::Generate<CppGenerator>();
-	std::cerr << "[main] -> Generate<MappingGenerator>\n";
-	Generator::Generate<MappingGenerator>();
-	std::cerr << "[main] -> Generate<IDAMappingGenerator>\n";
-	Generator::Generate<IDAMappingGenerator>();
-	std::cerr << "[main] -> Generate<DumpspaceGenerator>\n";
-	Generator::Generate<DumpspaceGenerator>();
+	// Each backend runs independently; if one throws on a reflection-stripped target we still
+	// want the others to produce their output (e.g. MappingGenerator may succeed even when
+	// CppGenerator trips on a missing class's CppName).
+	auto runGenerator = [](const char* name, auto generatorFn)
+	{
+		std::cerr << "[main] -> Generate<" << name << ">\n";
+		try
+		{
+			generatorFn();
+			std::cerr << "[main] <- Generate<" << name << "> ok\n";
+		}
+		catch (const std::exception& e)
+		{
+			std::cerr << "[main] <- Generate<" << name << "> threw: " << e.what() << "\n";
+		}
+		catch (...)
+		{
+			std::cerr << "[main] <- Generate<" << name << "> threw non-std exception\n";
+		}
+	};
+
+	runGenerator("CppGenerator",        [] { Generator::Generate<CppGenerator>(); });
+	runGenerator("MappingGenerator",    [] { Generator::Generate<MappingGenerator>(); });
+	runGenerator("IDAMappingGenerator", [] { Generator::Generate<IDAMappingGenerator>(); });
+	runGenerator("DumpspaceGenerator",  [] { Generator::Generate<DumpspaceGenerator>(); });
 	std::cerr << "[main] <- all generators\n";
 
 	const auto dumpEnd = std::chrono::high_resolution_clock::now();
