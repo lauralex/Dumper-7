@@ -44,6 +44,12 @@ int32_t OffsetFinder::FindUObjectFlagsOffset()
 
 			if (NumObjectsWithFlagAtOffset > MinNumFlagValuesRequiredAtOffset)
 				return Offset;
+
+			// FindOffset returns HighestFoundOffset == MinOffset when a match is at the scan's
+			// starting position, so without advancing past it here the while-loop spins forever
+			// whenever the count-check rejects the first candidate (common when 0x43 isn't the
+			// dominant flag value in the first 256 objects for this particular game).
+			Offset += sizeof(int32);
 		}
 	}
 

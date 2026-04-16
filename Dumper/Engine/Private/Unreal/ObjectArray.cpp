@@ -3,6 +3,9 @@
 #include <fstream>
 #include <format>
 #include <filesystem>
+#include <functional>
+#include <unordered_map>
+#include <vector>
 
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
@@ -13,6 +16,54 @@
 
 
 namespace fs = std::filesystem;
+
+// External-mode chunk cache: each GetByIndex used to issue 3 hypercalls (chunks-table ptr,
+// chunk base, item pointer). For games with ~100k+ UObjects and multiple full iteration
+// passes this dominated wall-clock time. We now bulk-read each chunk (~1.5 MB) on first
+// touch and serve subsequent lookups from the local buffer. Num() is also cached so the
+// iterator's null-skip loop doesn't issue a hypercall per step.
+namespace
+{
+	struct ChunkCacheEntry
+	{
+		uintptr_t RemoteBase = 0;
+		std::vector<uint8_t> Data;
+	};
+
+	std::vector<ChunkCacheEntry> g_ChunkCache;
+	int32 g_CachedNum = -1;
+	int32 g_CachedMax = -1;
+	int32 g_CachedNumChunks = -1;
+	int32 g_CachedMaxChunks = -1;
+
+	void PopulateChunkTable(uintptr_t ChunksTableVA, int32 NumChunks)
+	{
+		g_ChunkCache.clear();
+		g_ChunkCache.resize(NumChunks);
+
+		std::vector<uintptr_t> chunkBases(NumChunks);
+		RemoteMemory::ReadBuffer(ChunksTableVA, chunkBases.data(), NumChunks * sizeof(uintptr_t),
+			RemoteMemory::PartialReadPolicy::ErrorOnGap);
+		for (int32 i = 0; i < NumChunks; ++i)
+			g_ChunkCache[i].RemoteBase = chunkBases[i];
+	}
+
+	const uint8_t* EnsureChunkCached(int32 ChunkIndex, size_t ChunkSizeBytes)
+	{
+		if (ChunkIndex < 0 || ChunkIndex >= static_cast<int32>(g_ChunkCache.size()))
+			return nullptr;
+		auto& entry = g_ChunkCache[ChunkIndex];
+		if (entry.RemoteBase == 0)
+			return nullptr;
+		if (entry.Data.empty())
+		{
+			entry.Data.resize(ChunkSizeBytes);
+			RemoteMemory::ReadBuffer(entry.RemoteBase, entry.Data.data(), ChunkSizeBytes,
+				RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		}
+		return entry.Data.data();
+	}
+}
 
 constexpr inline std::array FFixedUObjectArrayLayouts =
 {
@@ -310,34 +361,39 @@ void ObjectArray::Init(bool bScanAllMemory, const char* const ModuleName)
 
 			std::cerr << "Found FChunkedFixedUObjectArray GObjects at offset 0x" << std::hex << Off::InSDK::ObjArray::GObjects << "\n\n";
 
-			ByIndex = [](void* ObjectsArray, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
+			uint8_t* ChunksPtr = DecryptPtr(reinterpret_cast<void*>(
+				RDeref<uintptr_t>(GObjects + Off::FUObjectArray::GetObjectsOffset())));
+
+			// Cache scalar header fields and the per-chunk base pointers up-front so subsequent
+			// GetByIndex/Num calls don't issue redundant hypercalls for values that don't change
+			// once the game's object array is settled (running against an idle/paused target).
+			g_CachedNum = RDeref<int32>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
+			g_CachedMax = RDeref<int32>(GObjects + Off::FUObjectArray::GetMaxElementsOffset());
+			g_CachedNumChunks = RDeref<int32>(GObjects + Off::FUObjectArray::GetNumChunksOffset());
+			g_CachedMaxChunks = RDeref<int32>(GObjects + Off::FUObjectArray::GetMaxChunksOffset());
+			PopulateChunkTable(reinterpret_cast<uintptr_t>(ChunksPtr), g_CachedNumChunks);
+
+			ByIndex = [](void* /*ObjectsArray*/, int32 Index, uint32 FUObjectItemSize, uint32 FUObjectItemOffset, uint32 PerChunk) -> void*
 			{
-				if (Index < 0 || Index > Num())
+				if (Index < 0 || Index >= g_CachedNum)
 					return nullptr;
 
 				const int32 ChunkIndex = Index / PerChunk;
 				const int32 InChunkIdx = Index % PerChunk;
+				const size_t ChunkBytes = static_cast<size_t>(PerChunk) * FUObjectItemSize;
 
-				// Step 1: *ObjectsArray → chunks-table remote VA, decrypt if required.
-				uint8_t* ChunkPtr = DecryptPtr(reinterpret_cast<void*>(
-					RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ObjectsArray))));
+				const uint8_t* Chunk = EnsureChunkCached(ChunkIndex, ChunkBytes);
+				if (!Chunk)
+					return nullptr;
 
-				// Step 2: chunks-table[ChunkIndex] → chunk base remote VA.
-				const uintptr_t Chunk = RDeref<uintptr_t>(
-					reinterpret_cast<uintptr_t>(ChunkPtr) + ChunkIndex * sizeof(void*));
-
-				// Step 3: chunk[InChunkIdx].Object at the correct item offset.
-				return reinterpret_cast<void*>(
-					RDeref<uintptr_t>(Chunk + (InChunkIdx * FUObjectItemSize) + FUObjectItemOffset));
+				const uint8_t* ItemPtr = Chunk + (InChunkIdx * FUObjectItemSize) + FUObjectItemOffset;
+				return reinterpret_cast<void*>(*reinterpret_cast<const uintptr_t*>(ItemPtr));
 			};
 
-			uint8_t* ChunksPtr = DecryptPtr(reinterpret_cast<void*>(
-				RDeref<uintptr_t>(GObjects + Off::FUObjectArray::GetObjectsOffset())));
-
-			// ChunksPtr now points at the chunk table (remote VA). Read the first chunk pointer
-			// and use it as the "FirstItem" argument for InitializeFUObjectItem's probes.
-			const uintptr_t firstChunkAddr = RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(ChunksPtr));
-			ObjectArray::InitializeFUObjectItem(reinterpret_cast<uint8_t*>(firstChunkAddr));
+			// InitializeFUObjectItem probes the first chunk directly via hypercalls; the cache is
+			// for subsequent lookups. Pass the first chunk's remote base to it.
+			if (!g_ChunkCache.empty())
+				ObjectArray::InitializeFUObjectItem(reinterpret_cast<uint8_t*>(g_ChunkCache[0].RemoteBase));
 		}
 
 		return;
@@ -475,21 +531,31 @@ void ObjectArray::DumpObjectsWithProperties(const fs::path& Path, bool bWithPath
 
 int32 ObjectArray::Num()
 {
+	// Serve from cache once Init() populated it; before that we're in the layout-detection
+	// phase where hypercalls are unavoidable.
+	if (g_CachedNum >= 0)
+		return g_CachedNum;
 	return RDeref<int32>(GObjects + Off::FUObjectArray::GetNumElementsOffset());
 }
 
 int32 ObjectArray::Max()
 {
+	if (g_CachedMax >= 0)
+		return g_CachedMax;
 	return RDeref<int32>(GObjects + Off::FUObjectArray::GetMaxElementsOffset());
 }
 
 int32 ObjectArray::NumChunks()
 {
+	if (g_CachedNumChunks >= 0)
+		return g_CachedNumChunks;
 	return RDeref<int32>(GObjects + Off::FUObjectArray::GetNumChunksOffset());
 }
 
 int32 ObjectArray::MaxChunks()
 {
+	if (g_CachedMaxChunks >= 0)
+		return g_CachedMaxChunks;
 	return RDeref<int32>(GObjects + Off::FUObjectArray::GetMaxChunksOffset());
 }
 
@@ -516,16 +582,36 @@ UEType ObjectArray::FindObject(const std::string& FullName, EClassCastFlags Requ
 template<typename UEType>
 UEType ObjectArray::FindObjectFast(const std::string& Name, EClassCastFlags RequiredType)
 {
-	auto ObjArray = ObjectArray();
+	// Per-process cache: offset-finders call FindObjectFast for the same handful of engine
+	// classes many times (Actor, Pawn, Color, Guid, Vector, Struct, ...), and each call
+	// iterates all ~100k UObjects. Caching by (name, type) turns that quadratic work into
+	// a single scan per unique lookup. The UEObject stored here is a thin handle around a
+	// remote VA, so caching a handle across calls stays valid for the lifetime of the dump.
+	using CacheKey = std::pair<std::string, EClassCastFlags>;
+	struct PairHash
+	{
+		size_t operator()(const CacheKey& k) const noexcept
+		{
+			return std::hash<std::string>{}(k.first) ^ static_cast<size_t>(k.second);
+		}
+	};
+	static std::unordered_map<CacheKey, UEObject, PairHash> cache;
 
+	const CacheKey key{ Name, RequiredType };
+	if (auto it = cache.find(key); it != cache.end())
+		return it->second.Cast<UEType>();
+
+	auto ObjArray = ObjectArray();
 	for (UEObject Object : ObjArray)
 	{
 		if (Object.IsA(RequiredType) && Object.GetName() == Name)
 		{
+			cache.emplace(key, Object);
 			return Object.Cast<UEType>();
 		}
 	}
 
+	cache.emplace(key, UEObject{}); // cache the miss too so repeated lookups don't re-scan
 	return UEType();
 }
 

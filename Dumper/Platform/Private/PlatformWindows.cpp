@@ -132,6 +132,64 @@ namespace
 		}
 	};
 
+	// Map the target's exe file from disk so we can use the on-disk bytes of read-only sections
+	// as a ground truth for pattern/string scans. Live memory reads via hv::read_virt_mem only
+	// see pages that are currently resident in the target; large parts of .rdata (strings, RTTI,
+	// constant pools) are demand-paged and typically not resident on a running UE5 target. For
+	// read-only sections the loader doesn't modify content after fixup, so disk == memory for
+	// our purposes.
+	struct DiskImageCache
+	{
+		HANDLE FileHandle = INVALID_HANDLE_VALUE;
+		HANDLE MappingHandle = nullptr;
+		const uint8_t* MappedBase = nullptr;
+		bool Attempted = false;
+
+		~DiskImageCache()
+		{
+			if (MappedBase) UnmapViewOfFile(MappedBase);
+			if (MappingHandle) CloseHandle(MappingHandle);
+			if (FileHandle != INVALID_HANDLE_VALUE) CloseHandle(FileHandle);
+		}
+	};
+
+	DiskImageCache& GetMainModuleDiskImage()
+	{
+		static DiskImageCache state;
+		if (state.Attempted)
+			return state;
+		state.Attempted = true;
+
+		const DWORD pid = RemoteMemory::GetTargetPid();
+		HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		if (!hProc) return state;
+		wchar_t path[MAX_PATH]{};
+		DWORD size = MAX_PATH;
+		const BOOL ok = QueryFullProcessImageNameW(hProc, 0, path, &size);
+		CloseHandle(hProc);
+		if (!ok) return state;
+
+		state.FileHandle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+			nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+		if (state.FileHandle == INVALID_HANDLE_VALUE)
+		{
+			std::cerr << std::format("[Platform] CreateFileW on target exe failed: GetLastError={}\n", GetLastError());
+			return state;
+		}
+		state.MappingHandle = CreateFileMappingW(state.FileHandle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+		if (!state.MappingHandle)
+		{
+			std::cerr << std::format("[Platform] CreateFileMappingW failed: GetLastError={}\n", GetLastError());
+			return state;
+		}
+		state.MappedBase = static_cast<const uint8_t*>(MapViewOfFile(state.MappingHandle, FILE_MAP_READ, 0, 0, 0));
+		if (!state.MappedBase)
+		{
+			std::cerr << std::format("[Platform] MapViewOfFile failed: GetLastError={}\n", GetLastError());
+		}
+		return state;
+	}
+
 	ModuleCache& GetMainModuleCache()
 	{
 		static ModuleCache cache;
@@ -155,6 +213,8 @@ namespace
 		const uint16_t sizeOfOptionalHeader = RemoteMemory::Read<uint16_t>(ntHeaders + 4 + 16);
 		const uintptr_t firstSectionAddr = ntHeaders + 4 + 20 + sizeOfOptionalHeader;
 
+		const DiskImageCache& disk = GetMainModuleDiskImage();
+
 		cache.Sections.reserve(numberOfSections);
 		for (uint16_t i = 0; i < numberOfSections; ++i)
 		{
@@ -175,11 +235,30 @@ namespace
 			if ((sh.Characteristics & IMAGE_SCN_MEM_READ) && entry.Size > 0)
 			{
 				entry.LocalBytes = std::make_unique<uint8_t[]>(entry.Size);
-				if (!RemoteMemory::ReadBuffer(entry.RemoteBase, entry.LocalBytes.get(), entry.Size,
-				                              RemoteMemory::PartialReadPolicy::ZeroFillOnGap))
+
+				const bool isWritable = (sh.Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+
+				// For read-only sections, prefer on-disk bytes (they match live memory for
+				// non-packed modules and aren't affected by demand-paging gaps). For writable
+				// sections (.data, .bss) the live memory is authoritative.
+				bool filled = false;
+				if (!isWritable && disk.MappedBase && sh.SizeOfRawData > 0)
 				{
-					std::cerr << "[Platform] Partial read on section '" << entry.Name
-					          << "' (size 0x" << std::hex << entry.Size << std::dec << ")\n";
+					const uint32_t copyBytes = (sh.SizeOfRawData < entry.Size) ? sh.SizeOfRawData : entry.Size;
+					std::memcpy(entry.LocalBytes.get(), disk.MappedBase + sh.PointerToRawData, copyBytes);
+					if (copyBytes < entry.Size)
+						std::memset(entry.LocalBytes.get() + copyBytes, 0, entry.Size - copyBytes);
+					filled = true;
+				}
+
+				if (!filled)
+				{
+					if (!RemoteMemory::ReadBuffer(entry.RemoteBase, entry.LocalBytes.get(), entry.Size,
+					                              RemoteMemory::PartialReadPolicy::ZeroFillOnGap))
+					{
+						std::cerr << "[Platform] Partial read on section '" << entry.Name
+						          << "' (size 0x" << std::hex << entry.Size << std::dec << ")\n";
+					}
 				}
 			}
 
@@ -462,20 +541,139 @@ void* PlatformWindows::IterateAllSectionsWithCallback(const std::function<bool(v
 
 namespace
 {
-	struct ModuleRange { uintptr_t Base; size_t Size; };
+	struct TargetModule { std::wstring Name; uintptr_t Base; size_t Size; };
 
-	const std::vector<ModuleRange>& GetTargetModuleRanges()
+	// Resolve the target process's PEB base address using NtQueryInformationProcess. Needs
+	// only PROCESS_QUERY_LIMITED_INFORMATION (the most permissive access right), which the
+	// protected targets we care about still grant to unprivileged callers. Returns 0 on any
+	// failure — the caller must fall back to Toolhelp in that case.
+	uintptr_t ResolveTargetPebAddress(DWORD pid)
 	{
-		static std::vector<ModuleRange> cache = []
+		HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+		if (!hProc)
 		{
-			std::vector<ModuleRange> out;
+			std::cerr << std::format("[Platform] OpenProcess(PQLI) failed for pid={}: GetLastError={}\n", pid, GetLastError());
+			return 0;
+		}
+
+		using NtQueryInformationProcess_t = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+		static const auto pNtQueryInformationProcess = reinterpret_cast<NtQueryInformationProcess_t>(
+			GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+		if (!pNtQueryInformationProcess)
+		{
+			std::cerr << "[Platform] Resolving NtQueryInformationProcess failed\n";
+			CloseHandle(hProc);
+			return 0;
+		}
+
+		struct PROCESS_BASIC_INFORMATION_MIN {
+			PVOID Reserved1;
+			PVOID PebBaseAddress;
+			PVOID Reserved2[2];
+			ULONG_PTR UniqueProcessId;
+			PVOID Reserved3;
+		} pbi{};
+
+		ULONG returnLength = 0;
+		const NTSTATUS status = pNtQueryInformationProcess(hProc, 0 /*ProcessBasicInformation*/,
+			&pbi, sizeof(pbi), &returnLength);
+		CloseHandle(hProc);
+
+		if (status != 0)
+		{
+			std::cerr << std::format("[Platform] NtQueryInformationProcess failed: status=0x{:X}\n", static_cast<uint32_t>(status));
+			return 0;
+		}
+		return reinterpret_cast<uintptr_t>(pbi.PebBaseAddress);
+	}
+
+	// Walk the target's PEB -> Ldr -> InMemoryOrderModuleList via hypercalls so we can enumerate
+	// loaded DLLs without needing handles on each module. The previous Toolhelp32Snapshot path
+	// fails with ERROR_ACCESS_DENIED against some protected targets; PEB reads go through hv's
+	// CR3-based reads so no target access rights are needed beyond what OpenProcess(PQLI) granted
+	// once to get the PEB pointer.
+	std::vector<TargetModule> EnumerateTargetModulesViaPebWalk(DWORD pid)
+	{
+		std::vector<TargetModule> out;
+		const uintptr_t pebAddr = ResolveTargetPebAddress(pid);
+		if (pebAddr == 0)
+			return out;
+
+		// PEB.Ldr is at offset 0x18 in 64-bit PEB.
+		const uintptr_t ldrAddr = RemoteMemory::Read<uintptr_t>(pebAddr + 0x18);
+		if (ldrAddr == 0)
+		{
+			std::cerr << "[Platform] PEB.Ldr is null\n";
+			return out;
+		}
+
+		// PEB_LDR_DATA.InMemoryOrderModuleList is at offset 0x20 (LIST_ENTRY).
+		const uintptr_t listHead = ldrAddr + 0x20;
+		const uintptr_t firstFlink = RemoteMemory::Read<uintptr_t>(listHead + 0);
+
+		// Entries are LDR_DATA_TABLE_ENTRY. The list links are InMemoryOrderLinks at offset 0x10
+		// of the entry, so the entry base is (Flink - 0x10). Relevant fields (from entry base):
+		//   +0x30 DllBase (PVOID)
+		//   +0x40 SizeOfImage (ULONG)
+		//   +0x48 FullDllName (UNICODE_STRING: USHORT Length, USHORT MaxLength, PVOID Buffer)
+		//   +0x58 BaseDllName (UNICODE_STRING)
+		uintptr_t flink = firstFlink;
+		for (int i = 0; i < 512 && flink != 0 && flink != listHead; ++i)
+		{
+			const uintptr_t entryBase = flink - 0x10;
+			const uintptr_t dllBase = RemoteMemory::Read<uintptr_t>(entryBase + 0x30);
+			const uint32_t sizeOfImage = RemoteMemory::Read<uint32_t>(entryBase + 0x40);
+
+			const uint16_t baseNameLen = RemoteMemory::Read<uint16_t>(entryBase + 0x58 + 0);
+			const uintptr_t baseNameBuf = RemoteMemory::Read<uintptr_t>(entryBase + 0x58 + 8);
+
+			if (dllBase != 0 && baseNameBuf != 0 && baseNameLen > 0 && baseNameLen < 0x400)
+			{
+				std::wstring name(baseNameLen / sizeof(wchar_t), L'\0');
+				RemoteMemory::ReadBuffer(baseNameBuf, name.data(), baseNameLen,
+					RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+
+				TargetModule m;
+				m.Name = std::move(name);
+				m.Base = dllBase;
+				m.Size = sizeOfImage;
+				out.push_back(std::move(m));
+			}
+
+			flink = RemoteMemory::Read<uintptr_t>(flink + 0); // Next entry's InMemoryOrderLinks.Flink
+		}
+
+		return out;
+	}
+
+	const std::vector<TargetModule>& GetTargetModulesCached()
+	{
+		static std::vector<TargetModule> cache = []
+		{
+			std::vector<TargetModule> out;
 			const DWORD pid = RemoteMemory::GetTargetPid();
 			if (!pid)
+			{
+				std::cerr << "[Platform] GetTargetModulesCached: pid=0\n";
 				return out;
+			}
 
+			// Primary path: walk the target's PEB via hypercalls. Works against protected targets
+			// where Toolhelp32Snapshot gets ERROR_ACCESS_DENIED.
+			out = EnumerateTargetModulesViaPebWalk(pid);
+			if (!out.empty())
+			{
+				std::cerr << std::format("[Platform] PEB walk enumerated {} modules\n", out.size());
+				return out;
+			}
+
+			// Fallback: Toolhelp32Snapshot for unprotected processes (notepad.exe-class).
 			HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
 			if (snap == INVALID_HANDLE_VALUE)
+			{
+				std::cerr << std::format("[Platform] CreateToolhelp32Snapshot fallback failed for pid={}: GetLastError={}\n", pid, GetLastError());
 				return out;
+			}
 
 			MODULEENTRY32W entry{};
 			entry.dwSize = sizeof(entry);
@@ -483,19 +681,114 @@ namespace
 			{
 				do
 				{
-					out.push_back({ reinterpret_cast<uintptr_t>(entry.modBaseAddr), entry.modBaseSize });
+					TargetModule m;
+					m.Name = entry.szModule;
+					m.Base = reinterpret_cast<uintptr_t>(entry.modBaseAddr);
+					m.Size = entry.modBaseSize;
+					out.push_back(std::move(m));
 				} while (Module32NextW(snap, &entry));
 			}
 			CloseHandle(snap);
+			std::cerr << std::format("[Platform] Toolhelp fallback enumerated {} modules\n", out.size());
 			return out;
 		}();
 		return cache;
+	}
+
+	uintptr_t FindTargetModuleBase(const wchar_t* moduleName)
+	{
+		for (const auto& m : GetTargetModulesCached())
+		{
+			if (_wcsicmp(m.Name.c_str(), moduleName) == 0)
+				return m.Base;
+		}
+		return 0;
+	}
+
+	// Walk a remote module's export directory to find a named export. Resolves one level of
+	// forwarder chains (e.g. kernel32!InitializeSRWLock -> ntdll.RtlInitializeSRWLock). Returns
+	// the absolute address of the final function in the target, or 0 on failure.
+	//
+	// This is the fallback path used when the main module's IMAGE_IMPORT_DESCRIPTOR table has
+	// been stripped/obfuscated at runtime (some UE5 shipping builds zero the descriptor array
+	// after the loader completes fixup — the IAT still holds the resolved addresses, but the
+	// descriptor walk can't discover which slot belongs to which import).
+	uintptr_t ResolveExportedFunctionByWalkingExports(uintptr_t moduleBase, const char* functionName)
+	{
+		if (moduleBase == 0 || !functionName)
+			return 0;
+
+		const uintptr_t nt = ReadNtHeadersAddress(moduleBase);
+		if (nt == 0)
+			return 0;
+
+		// DataDirectories[0] is the export directory; +4 is the size.
+		const uint32_t exportRva = RemoteMemory::Read<uint32_t>(nt + kDataDirectoriesOffset + 0);
+		const uint32_t exportSize = RemoteMemory::Read<uint32_t>(nt + kDataDirectoriesOffset + 4);
+		if (exportRva == 0 || exportSize == 0)
+			return 0;
+
+		const uintptr_t exportDir = moduleBase + exportRva;
+
+		// IMAGE_EXPORT_DIRECTORY layout of interest:
+		//   +0x14 NumberOfFunctions
+		//   +0x18 NumberOfNames
+		//   +0x1C AddressOfFunctions    (RVA -> DWORD[])
+		//   +0x20 AddressOfNames        (RVA -> DWORD[])
+		//   +0x24 AddressOfNameOrdinals (RVA -> WORD[])
+		const uint32_t numNames = RemoteMemory::Read<uint32_t>(exportDir + 0x18);
+		const uint32_t rvaFunctions = RemoteMemory::Read<uint32_t>(exportDir + 0x1C);
+		const uint32_t rvaNames = RemoteMemory::Read<uint32_t>(exportDir + 0x20);
+		const uint32_t rvaOrdinals = RemoteMemory::Read<uint32_t>(exportDir + 0x24);
+
+		if (numNames == 0 || numNames > 0x20000)
+			return 0;
+
+		for (uint32_t i = 0; i < numNames; ++i)
+		{
+			const uint32_t nameRva = RemoteMemory::Read<uint32_t>(moduleBase + rvaNames + i * 4);
+			char nameBuf[256]{};
+			RemoteMemory::ReadBuffer(moduleBase + nameRva, nameBuf, sizeof(nameBuf) - 1,
+				RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+
+			if (strcmp(nameBuf, functionName) != 0)
+				continue;
+
+			const uint16_t ordinal = RemoteMemory::Read<uint16_t>(moduleBase + rvaOrdinals + i * 2);
+			const uint32_t funcRva = RemoteMemory::Read<uint32_t>(moduleBase + rvaFunctions + ordinal * 4);
+
+			// If funcRva falls inside the export directory it's a forwarder string "dll.func".
+			if (funcRva >= exportRva && funcRva < (exportRva + exportSize))
+			{
+				char forwardBuf[256]{};
+				RemoteMemory::ReadBuffer(moduleBase + funcRva, forwardBuf, sizeof(forwardBuf) - 1,
+					RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+				const char* dot = strchr(forwardBuf, '.');
+				if (!dot)
+					return 0;
+
+				// "ntdll" -> L"ntdll.dll"
+				std::string mod(forwardBuf, dot - forwardBuf);
+				std::wstring wMod(mod.begin(), mod.end());
+				wMod += L".dll";
+
+				const uintptr_t forwardBase = FindTargetModuleBase(wMod.c_str());
+				if (!forwardBase)
+					return 0;
+				// Recursive but bounded in practice (forwarders rarely chain more than once).
+				return ResolveExportedFunctionByWalkingExports(forwardBase, dot + 1);
+			}
+
+			return moduleBase + funcRva;
+		}
+
+		return 0;
 	}
 }
 
 bool PlatformWindows::IsAddressInAnyModule(const uintptr_t Address)
 {
-	for (const ModuleRange& r : GetTargetModuleRanges())
+	for (const TargetModule& r : GetTargetModulesCached())
 	{
 		if (Address >= r.Base && Address < (r.Base + r.Size))
 			return true;
@@ -537,15 +830,37 @@ bool PlatformWindows::IsBadReadPtr(const void* Address)
 	return IsBadReadPtr(reinterpret_cast<uintptr_t>(Address));
 }
 
+namespace
+{
+	// Primary: walk the main module's IMAGE_IMPORT_DESCRIPTOR table. If that's been zeroed
+	// (some UE5 shipping builds do this after the loader completes fixup), fall back to
+	// resolving the export directly out of the library itself — the IAT slots in the main
+	// module end up with the final resolved address either way, so scanning for calls whose
+	// target-slot dereferences to this value still works.
+	uintptr_t ResolveImportedOrExportedFunction(const char* moduleToImportFrom, const char* functionName)
+	{
+		const uintptr_t viaImport = WalkMainModuleImportForFunction(moduleToImportFrom, functionName);
+		if (viaImport != 0)
+			return viaImport;
+
+		const std::string narrowName(moduleToImportFrom ? moduleToImportFrom : "");
+		const std::wstring wMod(narrowName.begin(), narrowName.end());
+		const uintptr_t modBase = FindTargetModuleBase(wMod.c_str());
+		if (modBase == 0)
+			return 0;
+		return ResolveExportedFunctionByWalkingExports(modBase, functionName);
+	}
+}
+
 const void* PlatformWindows::GetAddressOfImportedFunction(const char* /*SearchModuleName*/, const char* ModuleToImportFrom, const char* SearchFunctionName)
 {
 	// External v1 only walks the main module's imports; SearchModuleName is ignored.
-	return reinterpret_cast<const void*>(WalkMainModuleImportForFunction(ModuleToImportFrom, SearchFunctionName));
+	return reinterpret_cast<const void*>(ResolveImportedOrExportedFunction(ModuleToImportFrom, SearchFunctionName));
 }
 
 const void* PlatformWindows::GetAddressOfImportedFunctionFromAnyModule(const char* ModuleToImportFrom, const char* SearchFunctionName)
 {
-	return reinterpret_cast<const void*>(WalkMainModuleImportForFunction(ModuleToImportFrom, SearchFunctionName));
+	return reinterpret_cast<const void*>(ResolveImportedOrExportedFunction(ModuleToImportFrom, SearchFunctionName));
 }
 
 const void* PlatformWindows::GetAddressOfExportedFunction(const char* /*SearchModuleName*/, const char* /*SearchFunctionName*/)
