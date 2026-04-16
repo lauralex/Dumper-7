@@ -476,8 +476,20 @@ int32_t OffsetFinder::FindFFieldNextOffset()
 
 int32_t OffsetFinder::FindFFieldNameOffset()
 {
-	UEFField GuidChild = ObjectArray::FindStructFast("Guid").GetChildProperties();
-	UEFField VectorChild = ObjectArray::FindStructFast("Vector").GetChildProperties();
+	// Bail out if the probe structs or their ChildProperties links aren't resolvable in the
+	// target. Without valid GuidChild / VectorChild handles the inner loop would sweep
+	// FField::Name across all 4-byte positions and call GetName() -> ToString() at each one;
+	// with garbage FName bytes that produces FNamePool lookups with out-of-range ComparisonIndex
+	// values and frequently segfaults. Let the caller fall back to the hardcoded UE5.x default.
+	const UEStruct GuidStruct = ObjectArray::FindStructFast("Guid");
+	const UEStruct VectorStruct = ObjectArray::FindStructFast("Vector");
+	if (!GuidStruct || !VectorStruct)
+		return OffsetNotFound;
+
+	UEFField GuidChild = GuidStruct.GetChildProperties();
+	UEFField VectorChild = VectorStruct.GetChildProperties();
+	if (!GuidChild || !VectorChild)
+		return OffsetNotFound;
 
 	std::string GuidChildName = GuidChild.GetName();
 	std::string VectorChildName = VectorChild.GetName();

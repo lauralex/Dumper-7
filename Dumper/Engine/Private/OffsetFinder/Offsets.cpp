@@ -230,26 +230,58 @@ void Off::Init()
 
 	::NameArray::PostInit();
 
+	// UE5.1+ default struct-layout offsets used as fallbacks when discovery fails because the
+	// target has aggressively stripped reflection (e.g. some UE5 shipping builds lack
+	// UStruct/UField/PlayerController/Controller as registered UClass objects). Without these
+	// defaults the -1 OffsetNotFound values poison the rest of the pipeline and the dumper
+	// crashes before the output folder is created.
+	//
+	// Layout notes:
+	//   UE4 / pre-FStructBaseChain: UStruct members start right after UField::Next, so
+	//     Children = 0x38, ChildProperties = 0x40, PropertiesSize = 0x48 on x64.
+	//   UE5.1+ with FStructBaseChain inherited by UStruct: adds 16 bytes between UField and
+	//     UStruct's own members, so everything shifts by 0x10:
+	//     Children = 0x48, ChildProperties = 0x50, PropertiesSize = 0x58.
+	//
+	// We pick the fallback AFTER Size (PropertiesSize) has been discovered, since that
+	// position is easy to find reliably (FindStructSizeOffset matches Color/Guid sizes) and
+	// the rest of the UStruct members sit at fixed offsets relative to it.
+	constexpr int32 DefaultUFieldNext = 0x28;
+	constexpr int32 DefaultUStructSuper = DefaultUFieldNext + sizeof(void*);     // 0x30
+
 	// Castflags needs to stay here since the FindChildOffset() uses CastFlags
 	Off::UClass::CastFlags = OffsetFinder::FindCastFlagsOffset();
+	OverwriteIfInvalidOffset(Off::UClass::CastFlags, 0xD8); // UE5.1 default
 	std::cerr << std::format("Off::UClass::CastFlags: 0x{:X}\n", Off::UClass::CastFlags);
 
-	Off::UStruct::Children = OffsetFinder::FindChildOffset();
-	std::cerr << std::format("Off::UStruct::Children: 0x{:X}\n", Off::UStruct::Children);
-
 	Off::UField::Next = OffsetFinder::FindUFieldNextOffset();
+	OverwriteIfInvalidOffset(Off::UField::Next, DefaultUFieldNext);
 	std::cerr << std::format("Off::UField::Next: 0x{:X}\n", Off::UField::Next);
 
 	Off::UStruct::SuperStruct = OffsetFinder::FindSuperOffset();
+	OverwriteIfInvalidOffset(Off::UStruct::SuperStruct, DefaultUStructSuper);
 	std::cerr << std::format("Off::UStruct::SuperStruct: 0x{:X}\n", Off::UStruct::SuperStruct);
 
 	Off::UStruct::Size = OffsetFinder::FindStructSizeOffset();
+	OverwriteIfInvalidOffset(Off::UStruct::Size, 0x58); // UE5.1+ default
 	std::cerr << std::format("Off::UStruct::Size: 0x{:X}\n", Off::UStruct::Size);
 
 	Off::UStruct::MinAlignment = OffsetFinder::FindMinAlignmentOffset();
+	OverwriteIfInvalidOffset(Off::UStruct::MinAlignment, Off::UStruct::Size + sizeof(int32));
 	std::cerr << std::format("Off::UStruct::MinAlignment: 0x{:X}\n", Off::UStruct::MinAlignment);
 
+	// Derive Children / ChildProperties defaults from discovered Size. PropertiesSize sits
+	// right after ChildProperties (8 bytes) which sits right after Children (8 bytes).
+	const int32 DefaultUStructChildProperties = Off::UStruct::Size - static_cast<int32>(sizeof(void*));
+	const int32 DefaultUStructChildren = DefaultUStructChildProperties - static_cast<int32>(sizeof(void*));
+
+	Off::UStruct::Children = OffsetFinder::FindChildOffset();
+	OverwriteIfInvalidOffset(Off::UStruct::Children, DefaultUStructChildren);
+	std::cerr << std::format("Off::UStruct::Children: 0x{:X}\n", Off::UStruct::Children);
+
+	// Re-run CastFlags now that Children/Super offsets exist so the Cast<UEClass> paths work.
 	Off::UClass::CastFlags = OffsetFinder::FindCastFlagsOffset();
+	OverwriteIfInvalidOffset(Off::UClass::CastFlags, 0xD8);
 	std::cerr << std::format("Off::UClass::CastFlags: 0x{:X}\n", Off::UClass::CastFlags);
 
 	// Castflags become available for use
@@ -259,14 +291,17 @@ void Off::Init()
 		std::cerr << std::format("\nGame uses FProperty system\n\n");
 
 		Off::UStruct::ChildProperties = OffsetFinder::FindChildPropertiesOffset();
+		OverwriteIfInvalidOffset(Off::UStruct::ChildProperties, DefaultUStructChildProperties);
 		std::cerr << std::format("Off::UStruct::ChildProperties: 0x{:X}\n", Off::UStruct::ChildProperties);
 
-		OffsetFinder::FixupHardcodedOffsets(); // must be called after FindChildPropertiesOffset 
+		OffsetFinder::FixupHardcodedOffsets(); // must be called after FindChildPropertiesOffset
 
 		Off::FField::Next = OffsetFinder::FindFFieldNextOffset();
+		OverwriteIfInvalidOffset(Off::FField::Next, 0x20); // UE5.1 default (pre-CasePreserving adjustment)
 		std::cerr << std::format("Off::FField::Next: 0x{:X}\n", Off::FField::Next);
 
 		Off::FField::Class = OffsetFinder::FindFFieldClassOffset();
+		OverwriteIfInvalidOffset(Off::FField::Class, 0x08);
 		std::cerr << std::format("Off::FField::Class: 0x{:X}\n", Off::FField::Class);
 
 		// Comment out this line if you're crashing here and see if the NewFindFFieldNameOffset might work!
@@ -276,6 +311,7 @@ void Off::Init()
 		if (Off::FField::Name == OffsetFinder::OffsetNotFound)
 			Off::FField::Name = OffsetFinder::NewFindFFieldNameOffset();
 
+		OverwriteIfInvalidOffset(Off::FField::Name, 0x28); // UE5.1 default
 		std::cerr << std::format("Off::FField::Name: 0x{:X}\n", Off::FField::Name);
 
 		/*
