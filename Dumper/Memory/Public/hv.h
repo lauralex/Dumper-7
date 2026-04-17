@@ -41,7 +41,12 @@ enum hypercall_code : uint64_t {
   hypercall_remove_all_mmrs,
   hypercall_section_base,
   hypercall_set_section_base,
-  hypercall_scan_dtb
+  hypercall_scan_dtb,
+  // Indices 23..39 (R6S hooks, generic EPT hooks, enum_modules, enum_threads)
+  // are intentionally omitted in this vendored binding — Dumper-7 doesn't use
+  // them. Explicit value keeps the user-CR3 hypercall code in sync with the
+  // kernel enum in hv/hypercalls.h.
+  hypercall_query_process_user_cr3 = 40,
 };
 
 struct hypercall_input {
@@ -122,6 +127,17 @@ inline size_t write_virt_mem(uint64_t const cr3, void* const dst, void const* co
 inline uint64_t query_process_cr3(uint64_t const pid) {
   hypercall_input input;
   input.code    = hypercall_query_process_cr3;
+  input.key     = hypercall_key;
+  input.args[0] = pid;
+  return vmx_vmcall(input);
+}
+
+// USER-side CR3 (KPROCESS::UserDirectoryTableBase). Returns 0 if no valid
+// user CR3 is found — caller should fall back to query_process_cr3. Required
+// on KVAShadow-enabled Windows to read user-mode heap reliably.
+inline uint64_t query_process_user_cr3(uint64_t const pid) {
+  hypercall_input input;
+  input.code    = hypercall_query_process_user_cr3;
   input.key     = hypercall_key;
   input.args[0] = pid;
   return vmx_vmcall(input);

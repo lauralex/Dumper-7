@@ -38,6 +38,20 @@ namespace
 
 	void PopulateChunkTable(uintptr_t ChunksTableVA, int32 NumChunks)
 	{
+		// Sanity cap: if NumChunks came from a stale-CR3 read of GObjects,
+		// the value can be garbage (e.g. 0x7FFFFFFF). Allocating that many
+		// vectors eats every byte of available memory. UE's FChunkedFixedUObjectArray
+		// typically has 1..64 chunks for games with up to 4M objects; reject
+		// anything larger and bail rather than hang the dumper at 26 GB RSS.
+		if (NumChunks <= 0 || NumChunks > 1024)
+		{
+			std::cerr << "[ObjectArray] Refusing to populate chunk table with NumChunks="
+			          << NumChunks << " (out of sane range [1, 1024]). The GObjects read "
+			             "probably hit a stale CR3 — check CR3 validation.\n";
+			g_ChunkCache.clear();
+			return;
+		}
+
 		g_ChunkCache.clear();
 		g_ChunkCache.resize(NumChunks);
 
@@ -711,12 +725,25 @@ ObjectArray::ObjectsIterator& ObjectArray::ObjectsIterator::operator++()
 {
 	CurrentObject = ObjectArray::GetByIndex(++CurrentIndex);
 
-	while (!CurrentObject && CurrentIndex < (ObjectArray::Num() - 1))
+	// External-mode safety: cap the inner-scan count so a paged-out chunk (every
+	// GetByIndex returns nullptr) doesn't spin through millions of phantom slots.
+	// Num() is cached after init so it's a constant while we iterate, and normal
+	// iteration never re-enters this while loop more than a few times per ++.
+	int32 scanCount = 0;
+	const int32 maxScanPerStep = 0x10000;
+	const int32 num = ObjectArray::Num();
+	while (!CurrentObject && CurrentIndex < (num - 1) && scanCount < maxScanPerStep)
 	{
 		CurrentObject = ObjectArray::GetByIndex(++CurrentIndex);
+		++scanCount;
+	}
+	if (scanCount >= maxScanPerStep)
+	{
+		// Skipped through a very long run of null entries — jump to end to stop the iteration.
+		CurrentIndex = num;
 	}
 
-	if (!CurrentObject && CurrentIndex == (ObjectArray::Num() - 1)) [[unlikely]]
+	if (!CurrentObject && CurrentIndex == (num - 1)) [[unlikely]]
 		CurrentIndex++;
 
 	return *this;

@@ -213,6 +213,20 @@ namespace
 		const uint16_t sizeOfOptionalHeader = RemoteMemory::Read<uint16_t>(ntHeaders + 4 + 16);
 		const uintptr_t firstSectionAddr = ntHeaders + 4 + 20 + sizeOfOptionalHeader;
 
+		// Sanity: real PE binaries have < 96 sections; anything higher is almost certainly a
+		// garbage read (stale CR3 or paged-out NT headers). Also cap per-section size so a
+		// corrupt VirtualSize read doesn't explode into a multi-GB allocation. UE main modules
+		// top out around 300 MB for large .text sections.
+		constexpr uint16_t kMaxSanesections = 96;
+		constexpr uint32_t kMaxSaneSectionSize = 0x40000000; // 1 GB
+		if (numberOfSections == 0 || numberOfSections > kMaxSanesections)
+		{
+			std::cerr << "[Platform] NumberOfSections=" << numberOfSections
+			          << " is out of sane range; NT headers probably corrupt. Skipping cache.\n";
+			cache.Initialized = true;
+			return cache;
+		}
+
 		const DiskImageCache& disk = GetMainModuleDiskImage();
 
 		cache.Sections.reserve(numberOfSections);
@@ -223,6 +237,14 @@ namespace
 			if (!RemoteMemory::ReadBuffer(shAddr, &sh, sizeof(sh), RemoteMemory::PartialReadPolicy::ErrorOnGap))
 			{
 				std::cerr << "[Platform] Failed to read section header #" << i << "\n";
+				continue;
+			}
+
+			if (sh.VirtualSize > kMaxSaneSectionSize)
+			{
+				std::cerr << "[Platform] Section #" << i << " reports VirtualSize=0x"
+				          << std::hex << sh.VirtualSize << std::dec
+				          << " (> 1 GB cap); skipping to avoid runaway allocation.\n";
 				continue;
 			}
 

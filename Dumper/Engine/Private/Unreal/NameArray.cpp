@@ -82,6 +82,21 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 
 		GetStr = [](uint8* NameEntry) -> std::wstring
 		{
+			// Per-thread recursion guard. Outline-number FNameEntries reference a sibling
+			// entry by index (the NameLen==0 branch below). When the target's FNamePool is
+			// partially paged-out or we're using a stale CR3, `NextEntryIndex` is garbage and
+			// can form a cycle — the recursive resolver then blows up the stack and allocates
+			// std::wstring instances at every frame (26 GB observed). Capping depth breaks the
+			// cycle with a sentinel string.
+			thread_local int recursionDepth = 0;
+			constexpr int kMaxRecursionDepth = 8;
+			struct DepthGuard {
+				int* d; DepthGuard(int* p) : d(p) { ++*p; }
+				~DepthGuard() { --*d; }
+			} guard(&recursionDepth);
+			if (recursionDepth > kMaxRecursionDepth)
+				return L"__fname_cycle__";
+
 			// NameEntry is a remote VA. Read the header word first, compute the string length,
 			// then bulk-read the string payload into a local buffer.
 			const uint16 HeaderWithoutNumber = RDeref<uint16>(NameEntry + Off::FNameEntry::NamePool::HeaderOffset);
@@ -94,26 +109,41 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 				const int32 NextEntryIndex = RDeref<int32>(NameEntry + EntryIdOffset);
 				const int32 Number = RDeref<int32>(NameEntry + EntryIdOffset + sizeof(int32));
 
-				if (Number > 0)
+				// Sanity check NextEntryIndex: must be within FNamePool's valid range. Garbage
+				// reads (paged-out pool) frequently produce huge or negative indices.
+				if (NextEntryIndex <= 0 || NextEntryIndex > 0x04000000)
+					return L"";
+
+				if (Number > 0 && Number < 0x100000)
 					return NameArray::GetNameEntry(NextEntryIndex).GetWString() + L'_' + std::to_wstring(Number - 1);
 
 				return NameArray::GetNameEntry(NextEntryIndex).GetWString();
 			}
 
 			// Sanity clamp to avoid huge reads on corrupt pointers.
-			const int32 clampedLen = (NameLen > 0x400) ? 0x400 : NameLen;
+			const int32 clampedLen = (NameLen > 0x400) ? 0x400 : (NameLen < 0 ? 0 : NameLen);
+			if (clampedLen == 0)
+				return L"";
 			const uintptr_t stringAddr = reinterpret_cast<uintptr_t>(NameEntry) + Off::FNameEntry::NamePool::StringOffset;
+
+			// Reusable thread-local buffers to avoid allocating per call. Per-iteration
+			// 1..2 KB wstring allocations were causing working-set growth via heap
+			// fragmentation: malloc/free pairs leave a fragmented free list that Windows
+			// won't return to the OS, so 100 k iterations of Object.GetName() pushed RSS
+			// into the GB range on 117 k-object games.
+			thread_local std::vector<wchar_t> wideBuf;
+			thread_local std::vector<char> narrowBuf;
 
 			if (HeaderWithoutNumber & NameWideMask)
 			{
-				std::wstring wide(clampedLen, L'\0');
-				RemoteMemory::ReadBuffer(stringAddr, wide.data(), clampedLen * sizeof(wchar_t), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
-				return wide;
+				if (wideBuf.size() < static_cast<size_t>(clampedLen)) wideBuf.resize(clampedLen);
+				RemoteMemory::ReadBuffer(stringAddr, wideBuf.data(), clampedLen * sizeof(wchar_t), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+				return std::wstring(wideBuf.data(), clampedLen);
 			}
 
-			std::string narrow(clampedLen, '\0');
-			RemoteMemory::ReadBuffer(stringAddr, narrow.data(), clampedLen, RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
-			return UtfN::StringToWString(narrow);
+			if (narrowBuf.size() < static_cast<size_t>(clampedLen)) narrowBuf.resize(clampedLen);
+			RemoteMemory::ReadBuffer(stringAddr, narrowBuf.data(), clampedLen, RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+			return UtfN::StringToWString(std::string(narrowBuf.data(), clampedLen));
 		};
 	}
 	else

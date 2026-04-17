@@ -155,6 +155,22 @@ namespace
 
 int main(int argc, char** argv)
 {
+	// Disable stderr buffering so redirects to files flush immediately — otherwise when the
+	// dumper gets killed for hitting a memory cap, all unflushed trace output is lost and
+	// debugging is blind.
+	std::setvbuf(stderr, nullptr, _IONBF, 0);
+
+	// Enable low-fragmentation heap on the process heap. Without this, the many 1-2 KB
+	// wstring allocations from FName resolution over ~100 k objects fragment the default
+	// heap and working set inflates to multiple GB without actually being used — the
+	// dumper would OOM-kill or take forever paging. LFH keeps free blocks in size-binned
+	// lookaside lists and coalesces aggressively.
+	{
+		HANDLE heap = GetProcessHeap();
+		ULONG info = 2;
+		HeapSetInformation(heap, HeapCompatibilityInformation, &info, sizeof(info));
+	}
+
 	Settings::Config::Load();
 
 	std::cerr << "Dumper-7 (external mode)\n";

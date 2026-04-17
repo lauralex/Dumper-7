@@ -78,25 +78,41 @@ namespace RemoteMemory
 			return false;
 		}
 
-		// Query_process_cr3 walks ActiveProcessLinks; returns the first EPROCESS match. On
-		// anti-cheat-protected targets this sometimes lands on a stale/decoy entry. Ask both
-		// primary and fallback; pick whichever validates against the main module's 'MZ'.
-		const uint64_t cr3a = hv::query_process_cr3(pid);
-		const uint64_t cr3b = hv::scan_process_dtb(pid);
-		std::cerr << std::format("[RemoteMemory] query_process_cr3=0x{:X}, scan_process_dtb=0x{:X}\n", cr3a, cr3b);
+		// Prefer KPROCESS::UserDirectoryTableBase over DirectoryTableBase. On KVAShadow-
+		// enabled Windows (10 1803+ / 11) the kernel CR3 at KPROCESS+0x28 only maps the
+		// subset of user-mode pages needed for kernel↔user transitions — the target's
+		// heap pages we walk to reach ChildProperties and FField chains aren't mapped in
+		// that CR3, so reads return zeros and every offset finder dead-ends. The user
+		// CR3 (UserDirectoryTableBase) has the full user-mode mapping.
+		//
+		// Fallback chain: user CR3 → kernel CR3 → scan_process_dtb. Every candidate has
+		// to pass the 'MZ' validation at main module base; if none do, we bail.
+		const uint64_t userCr3 = hv::query_process_user_cr3(pid);
+		const uint64_t kernelCr3 = hv::query_process_cr3(pid);
+		const uint64_t scanCr3 = hv::scan_process_dtb(pid);
+		std::cerr << std::format(
+			"[RemoteMemory] query_process_user_cr3=0x{:X}, query_process_cr3=0x{:X}, scan_process_dtb=0x{:X}\n",
+			userCr3, kernelCr3, scanCr3);
 
-		if (ValidateCr3(cr3a, g_mainModuleBase))
+		if (ValidateCr3(userCr3, g_mainModuleBase))
 		{
-			hv::g_cr3 = cr3a;
+			hv::g_cr3 = userCr3;
+			std::cerr << "[RemoteMemory] Using USER CR3 (KPROCESS::UserDirectoryTableBase)\n";
 		}
-		else if (ValidateCr3(cr3b, g_mainModuleBase))
+		else if (ValidateCr3(kernelCr3, g_mainModuleBase))
 		{
-			std::cerr << "[RemoteMemory] query_process_cr3 didn't validate; using scan_process_dtb CR3\n";
-			hv::g_cr3 = cr3b;
+			hv::g_cr3 = kernelCr3;
+			std::cerr << "[RemoteMemory] Using KERNEL CR3 (KPROCESS::DirectoryTableBase). "
+			             "User-mode heap reads may fail on KVAShadow-enabled systems.\n";
+		}
+		else if (ValidateCr3(scanCr3, g_mainModuleBase))
+		{
+			hv::g_cr3 = scanCr3;
+			std::cerr << "[RemoteMemory] Using scan_process_dtb CR3 (primary queries didn't validate)\n";
 		}
 		else
 		{
-			std::cerr << "[RemoteMemory] Neither CR3 candidate passes the 'MZ' validation at 0x"
+			std::cerr << "[RemoteMemory] No CR3 candidate passes the 'MZ' validation at 0x"
 			          << std::hex << g_mainModuleBase << std::dec << "\n";
 			return false;
 		}
