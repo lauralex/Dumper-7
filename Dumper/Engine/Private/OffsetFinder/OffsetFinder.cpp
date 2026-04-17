@@ -232,36 +232,69 @@ int32_t OffsetFinder::FindUObjectNameOffset()
 
 int32_t OffsetFinder::FindUObjectOuterOffset()
 {
-	int32_t LowestFoundOffset = 0xFFFF;
+	// Score-based discovery: sample N UObjects, count how many have a valid pointer at each
+	// candidate offset in [Name+8, 0x50). The smallest offset with a high hit rate (ignoring
+	// packages, which legitimately have null Outer) is Outer. This replaces the old 2-object
+	// random-probe, which picks the lowest offset that happens to pass pointer validity in any
+	// of 16 random tries — on stripped UE5 targets where most first-page UObjects are packages
+	// or stale stubs, the old algorithm landed on 0x30 (UStruct::StructBaseChain.Array) instead
+	// of 0x20 (the real Outer).
+	const int32_t MinOuter = Off::UObject::Name > 0 ? (Off::UObject::Name + sizeof(int32) * 2) : (Off::UObject::Class > 0 ? Off::UObject::Class : 0x20);
+	const int32_t MaxOuter = 0x50;
 
-	// Outer always lives after Name (FName, 8B) in the UObject layout. Starting the scan at
-	// Name + 8 avoids false positives where the 8 bytes at Name (ComparisonIndex + Number)
-	// happen to pass the pointer-validity probe.
-	const int32_t MinOuter = Off::UObject::Name > 0 ? (Off::UObject::Name + sizeof(int32) * 2) : (Off::UObject::Class > 0 ? Off::UObject::Class : 0);
-	const int32_t InitialOffset = MinOuter - static_cast<int32_t>(sizeof(void*)); // the inner loop adds sizeof(void*) on entry
+	constexpr int32_t kSampleCount = 256;
+	constexpr int32_t kMinValidHitsPercent = 60; // non-package UObjects; packages have null Outer
 
-	// loop a few times in case we accidentally choose a UPackage (which doesn't have an Outer) to find Outer
-	for (int i = 0; i < 0x10; i++)
+	auto looksLikeUserPtr = [](uintptr_t p) -> bool
 	{
-		int32_t Offset = InitialOffset;
+		return p >= 0x10000 && p < 0x0000800000000000ULL;
+	};
 
-		const void* ObjA = ObjectArray::GetByIndex(rand() % 0x400).GetAddress();
-		const void* ObjB = ObjectArray::GetByIndex(rand() % 0x400).GetAddress();
-
-		while (Offset != OffsetNotFound)
-		{
-			Offset = GetValidPointerOffset(ObjA, ObjB, Offset + sizeof(void*), 0x50);
-
-			// Make sure we didn't re-find the Class offset or Index (if the Index filed is a valid pionter for some ungodly reason).
-			if (Offset != Off::UObject::Class && Offset != Off::UObject::Index)
-				break;
-		}
-
-		if (Offset != OffsetNotFound && Offset < LowestFoundOffset)
-			LowestFoundOffset = Offset;
+	struct OffsetScore { int32_t Offset; int32_t Valid; int32_t Null; };
+	std::vector<OffsetScore> scores;
+	for (int32_t off = MinOuter; off < MaxOuter; off += static_cast<int32_t>(sizeof(void*)))
+	{
+		if (off == Off::UObject::Class || off == Off::UObject::Index)
+			continue;
+		scores.push_back({ off, 0, 0 });
 	}
 
-	return LowestFoundOffset == 0xFFFF ? OffsetNotFound : LowestFoundOffset;
+	const int32 num = ObjectArray::Num();
+	const int32 samplePoolSize = num > kSampleCount ? kSampleCount : num;
+	for (int32 i = 0; i < samplePoolSize; ++i)
+	{
+		// Evenly sample across the object array so we aren't biased to the first few hundred slots
+		// (those are mostly packages).
+		const int32 idx = (num / samplePoolSize) * i;
+		const uint8_t* obj = static_cast<const uint8_t*>(ObjectArray::GetByIndex(idx).GetAddress());
+		if (!obj)
+			continue;
+
+		for (OffsetScore& s : scores)
+		{
+			const uintptr_t val = RDeref<uintptr_t>(obj + s.Offset);
+			if (val == 0)
+				++s.Null;
+			else if (looksLikeUserPtr(val))
+				++s.Valid;
+		}
+	}
+
+	// Pick the smallest offset whose (Valid count) / sampled >= threshold. Offsets with lots of
+	// null values but few valid pointers are unlikely to be Outer (they're padding or some other
+	// rarely-set field).
+	const int32_t hitThreshold = (samplePoolSize * kMinValidHitsPercent) / 100;
+	int32_t BestOffset = OffsetNotFound;
+	for (const OffsetScore& s : scores)
+	{
+		if (s.Valid >= hitThreshold)
+		{
+			BestOffset = s.Offset;
+			break; // smallest offset wins; vector is populated in ascending order
+		}
+	}
+
+	return BestOffset;
 }
 
 void OffsetFinder::FixupHardcodedOffsets()

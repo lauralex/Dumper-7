@@ -1,7 +1,11 @@
 #include "RemoteMemory.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstring>
+#include <format>
 #include <iostream>
+#include <mutex>
 #include <Windows.h>
 
 #include "hv.h"
@@ -15,6 +19,15 @@ namespace RemoteMemory
 		DWORD g_pid = 0;
 		uint64_t g_mainModuleBase = 0;
 		size_t g_mainModuleSize = 0;
+
+		// CR3 auto-refresh state. Anti-cheat systems like EAC rotate the target's CR3 every
+		// few minutes; any cached CR3 goes stale and every subsequent hv::read_virt_mem returns
+		// zero bytes. We guard against that by periodically (and on read-failure) re-querying
+		// and re-validating the CR3 via 'MZ' at the main module base.
+		std::mutex g_Cr3Mutex;
+		std::chrono::steady_clock::time_point g_LastCr3Check{};
+		constexpr std::chrono::seconds kCr3RevalidateCooldown{5};
+		std::atomic<uint64_t> g_Cr3RefreshCount{0};
 
 		inline uintptr_t PageDown(uintptr_t addr)
 		{
@@ -65,6 +78,58 @@ namespace RemoteMemory
 		if (hv::read_virt_mem(candidate, &probe, reinterpret_cast<void*>(moduleBase), sizeof(probe)) != sizeof(probe))
 			return false;
 		return probe == 0x5A4D;
+	}
+
+	// Re-query the target's CR3 and install the first candidate that still validates against the
+	// main module's 'MZ' signature. Returns true when a different CR3 was installed. The 'force'
+	// flag bypasses the cooldown — used by the read-failure path that already knows the current
+	// CR3 is stale; the periodic path respects the cooldown to avoid thrashing.
+	bool TryRefreshCr3(bool force)
+	{
+		std::lock_guard<std::mutex> lock(g_Cr3Mutex);
+
+		const auto now = std::chrono::steady_clock::now();
+		if (!force && (now - g_LastCr3Check) < kCr3RevalidateCooldown)
+			return false;
+		g_LastCr3Check = now;
+
+		const uint64_t current = hv::g_cr3;
+		if (ValidateCr3(current, static_cast<uintptr_t>(g_mainModuleBase)))
+			return false; // still good
+
+		const uint64_t candidates[3] = {
+			hv::query_process_user_cr3(g_pid),
+			hv::query_process_cr3(g_pid),
+			hv::scan_process_dtb(g_pid),
+		};
+		static const char* const names[3] = { "user", "kernel", "scan" };
+
+		for (int i = 0; i < 3; ++i)
+		{
+			if (candidates[i] == current || candidates[i] == 0)
+				continue;
+			if (!ValidateCr3(candidates[i], static_cast<uintptr_t>(g_mainModuleBase)))
+				continue;
+			hv::g_cr3 = candidates[i];
+			++g_Cr3RefreshCount;
+			std::cerr << std::format(
+				"[RemoteMemory] CR3 rotated by AC/kernel — switched to {} CR3 0x{:X} "
+				"(was 0x{:X}, refresh #{})\n",
+				names[i], candidates[i], current, g_Cr3RefreshCount.load());
+			return true;
+		}
+
+		std::cerr << std::format(
+			"[RemoteMemory] CR3 rotation detected but no candidate validates: "
+			"user=0x{:X} kernel=0x{:X} scan=0x{:X} (current=0x{:X}). "
+			"Reads will continue to fail until next probe.\n",
+			candidates[0], candidates[1], candidates[2], current);
+		return false;
+	}
+
+	uint64_t GetCr3RefreshCount()
+	{
+		return g_Cr3RefreshCount.load();
 	}
 
 	bool Init(DWORD pid)
@@ -141,13 +206,33 @@ namespace RemoteMemory
 		uint8_t* out = static_cast<uint8_t*>(dst);
 		size_t remaining = size;
 		uintptr_t cursor = addr;
+		int zeroBytePages = 0;
+		int totalPages = 0;
+		bool triedCr3Refresh = false;
 
 		while (remaining > 0)
 		{
 			const uintptr_t pageEnd = PageDown(cursor) + PageSize;
 			const size_t chunk = (pageEnd - cursor) < remaining ? (pageEnd - cursor) : remaining;
 
-			const size_t got = hv::read_virt_mem(out, reinterpret_cast<void*>(cursor), chunk);
+			size_t got = hv::read_virt_mem(out, reinterpret_cast<void*>(cursor), chunk);
+			++totalPages;
+			if (got == 0)
+			{
+				// A total read failure can mean: (a) the page is genuinely not resident, or
+				// (b) the anti-cheat rotated CR3 and every read is now failing. Try refreshing
+				// CR3 once per ReadBuffer and retry; if the page still reads zero, fall through
+				// to the policy handling below.
+				if (!triedCr3Refresh)
+				{
+					triedCr3Refresh = true;
+					if (TryRefreshCr3(/*force=*/true))
+						got = hv::read_virt_mem(out, reinterpret_cast<void*>(cursor), chunk);
+				}
+				if (got == 0)
+					++zeroBytePages;
+			}
+
 			if (got != chunk)
 			{
 				if (policy == PartialReadPolicy::ErrorOnGap)
@@ -162,6 +247,11 @@ namespace RemoteMemory
 			cursor    += chunk;
 			remaining -= chunk;
 		}
+
+		// If every page failed with zero bytes we're almost certainly on a stale CR3; schedule a
+		// periodic re-check for the next ReadBuffer call (the cooldown prevents thrashing).
+		if (zeroBytePages == totalPages && totalPages > 0)
+			TryRefreshCr3(/*force=*/false);
 
 		return true;
 	}

@@ -6,6 +6,7 @@
 #include <functional>
 #include <unordered_map>
 #include <vector>
+#include <chrono>
 
 #include "Unreal/ObjectArray.h"
 #include "OffsetFinder/Offsets.h"
@@ -651,16 +652,26 @@ UEType ObjectArray::FindObjectFast(const std::string& Name, EClassCastFlags Requ
 	if (auto it = cache.find(key); it != cache.end())
 		return it->second.Cast<UEType>();
 
+	const auto t0 = std::chrono::steady_clock::now();
+
 	auto ObjArray = ObjectArray();
+	int32 scanned = 0;
 	for (UEObject Object : ObjArray)
 	{
+		++scanned;
 		if (Object.IsA(RequiredType) && Object.GetName() == Name)
 		{
+			const auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+			if (dt > 0.5)
+				std::cerr << std::format("[FindObjectFast] HIT name='{}' at index~{} elapsed={:.2f}s\n", Name, scanned, dt);
 			cache.emplace(key, Object);
 			return Object.Cast<UEType>();
 		}
 	}
 
+	const auto dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+	if (dt > 0.5)
+		std::cerr << std::format("[FindObjectFast] MISS name='{}' scanned={} elapsed={:.2f}s\n", Name, scanned, dt);
 	cache.emplace(key, UEObject{}); // cache the miss too so repeated lookups don't re-scan
 	return UEType();
 }

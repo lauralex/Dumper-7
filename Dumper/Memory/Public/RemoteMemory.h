@@ -41,6 +41,13 @@ namespace RemoteMemory
 
 	bool IsValid(uintptr_t addr);
 
+	// CR3 rotation handling. TryRefreshCr3 re-queries the target's CR3 (user → kernel → scan)
+	// and installs the first candidate that validates via 'MZ' at the main module base. The
+	// ReadBuffer path calls it automatically on total read failure; callers can also invoke it
+	// manually for long-running work that doesn't issue reads for a while.
+	bool TryRefreshCr3(bool force);
+	uint64_t GetCr3RefreshCount();
+
 	template <typename T>
 	inline T Read(uintptr_t addr)
 	{

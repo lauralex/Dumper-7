@@ -1,5 +1,7 @@
 
+#include <cstring>
 #include <format>
+#include <vector>
 
 #include "Unreal/ObjectArray.h"
 #include "Unreal/NameArray.h"
@@ -10,6 +12,114 @@
 #include "RemoteMemory.h"
 
 uint8* NameArray::GNames = nullptr;
+
+namespace
+{
+	// Bulk-cached FNamePool chunks. Each chunk is reallocated into a local buffer on Init so that
+	// FName::ToString resolves locally instead of issuing 3-4 hypercalls per lookup (chunks-array
+	// pointer + chunk base + entry header + string bytes). On a target where FindObjectFast must
+	// miss (stripped class), the cache turns a ~1M hypercall iteration into ~117k (just one
+	// Object-bytes read per name) + local memcpy.
+	//
+	// The cache is populated once at NameArray::Init and never invalidated. That's safe because
+	// the FNamePool only grows (never moves existing chunks) during the game's lifetime, and we
+	// run against an idle/paused target. If future runs start mid-gameplay with live name
+	// additions, add a periodic re-read of {NumChunks, ByteCursor} and grow the cache as needed.
+	struct FNamePoolChunkCache
+	{
+		std::vector<uintptr_t> ChunkRemoteBases;        // [i] → remote VA of chunk i
+		std::vector<std::vector<uint8_t>> ChunkBuffers; // [i] → local bytes of chunk i
+		size_t ChunkSizeBytes = 0;
+		int32 CachedNumChunks = -1;
+		int32 CachedByteCursor = -1;
+		bool Populated = false;
+	};
+
+	FNamePoolChunkCache g_NamePoolCache;
+}
+
+// Translate a remote FNameEntry VA into a local pointer inside the cached chunk buffer.
+// Returns nullptr if the address isn't inside any cached chunk — callers fall back to
+// hypercalls in that case.
+const uint8_t* NameArray::TryResolveLocalNameEntry(uintptr_t RemoteVA)
+{
+	if (!g_NamePoolCache.Populated)
+		return nullptr;
+	for (size_t i = 0; i < g_NamePoolCache.ChunkRemoteBases.size(); ++i)
+	{
+		const uintptr_t base = g_NamePoolCache.ChunkRemoteBases[i];
+		if (base == 0) continue;
+		const size_t size = g_NamePoolCache.ChunkBuffers[i].size();
+		if (RemoteVA >= base && RemoteVA < base + size)
+			return g_NamePoolCache.ChunkBuffers[i].data() + (RemoteVA - base);
+	}
+	return nullptr;
+}
+
+int32 NameArray::GetCachedNumChunks()
+{
+	return g_NamePoolCache.CachedNumChunks;
+}
+
+int32 NameArray::GetCachedByteCursor()
+{
+	return g_NamePoolCache.CachedByteCursor;
+}
+
+uintptr_t NameArray::GetCachedChunkBase(int32 ChunkIndex)
+{
+	if (!g_NamePoolCache.Populated) return 0;
+	if (ChunkIndex < 0 || ChunkIndex >= static_cast<int32>(g_NamePoolCache.ChunkRemoteBases.size()))
+		return 0;
+	return g_NamePoolCache.ChunkRemoteBases[ChunkIndex];
+}
+
+void NameArray::PopulateFNamePoolCache(uintptr_t FNamePoolRemote, int32 NumChunks, int32 BlockOffsetBits, int32 Stride, int32 ByteCursor)
+{
+	// Per-chunk size: (1 << BlockOffsetBits) * Stride is the maximum byte-offset addressable
+	// by ByIndex. UE's FNameEntryAllocator rounds up its allocations to this size.
+	const size_t chunkSize = static_cast<size_t>(1ULL << BlockOffsetBits) * static_cast<size_t>(Stride);
+
+	g_NamePoolCache.ChunkRemoteBases.assign(NumChunks, 0);
+	g_NamePoolCache.ChunkBuffers.assign(NumChunks, std::vector<uint8_t>{});
+	g_NamePoolCache.ChunkSizeBytes = chunkSize;
+	g_NamePoolCache.CachedNumChunks = NumChunks;
+	g_NamePoolCache.CachedByteCursor = ByteCursor;
+	g_NamePoolCache.Populated = false;
+
+	const uintptr_t chunkArrayAddr = FNamePoolRemote + 0x10;
+	std::vector<uintptr_t> chunkPtrs(NumChunks);
+	if (!RemoteMemory::ReadBuffer(chunkArrayAddr, chunkPtrs.data(),
+		NumChunks * sizeof(uintptr_t), RemoteMemory::PartialReadPolicy::ErrorOnGap))
+	{
+		std::cerr << "[NameArray] Failed to read chunk pointers; cache disabled\n";
+		return;
+	}
+
+	size_t totalBytes = 0;
+	for (int32 i = 0; i < NumChunks; ++i)
+	{
+		if (chunkPtrs[i] == 0)
+			continue;
+
+		g_NamePoolCache.ChunkRemoteBases[i] = chunkPtrs[i];
+
+		// Only populate up to ByteCursor for the final chunk so we don't pull in unmapped pages.
+		const size_t bytesToRead = (i == NumChunks - 1)
+			? (ByteCursor > 0 && static_cast<size_t>(ByteCursor) < chunkSize ? static_cast<size_t>(ByteCursor) : chunkSize)
+			: chunkSize;
+
+		g_NamePoolCache.ChunkBuffers[i].resize(bytesToRead);
+		RemoteMemory::ReadBuffer(chunkPtrs[i], g_NamePoolCache.ChunkBuffers[i].data(),
+			bytesToRead, RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		totalBytes += bytesToRead;
+	}
+
+	g_NamePoolCache.Populated = true;
+	std::cerr << std::format("[NameArray] FNamePool cache populated: {} chunks, {} KB total\n",
+		NumChunks, totalBytes / 1024);
+}
+
 
 FNameEntry::FNameEntry(void* Ptr)
 	: Address((uint8*)Ptr)
@@ -97,8 +207,45 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 			if (recursionDepth > kMaxRecursionDepth)
 				return L"__fname_cycle__";
 
-			// NameEntry is a remote VA. Read the header word first, compute the string length,
-			// then bulk-read the string payload into a local buffer.
+			// Fast path: if the entry lives inside a cached FNamePool chunk, do the whole
+			// header+string parse from local memory. That turns ~3 hypercalls into 0 and is
+			// the difference between seconds and minutes on any FindObjectFast miss.
+			if (const uint8_t* local = NameArray::TryResolveLocalNameEntry(reinterpret_cast<uintptr_t>(NameEntry)))
+			{
+				auto LocalRead16 = [](const uint8_t* p) { uint16 v; std::memcpy(&v, p, 2); return v; };
+				auto LocalRead32 = [](const uint8_t* p) { int32  v; std::memcpy(&v, p, 4); return v; };
+
+				const uint16 HeaderWithoutNumber = LocalRead16(local + Off::FNameEntry::NamePool::HeaderOffset);
+				const int32 NameLen = HeaderWithoutNumber >> FNameEntry::FNameEntryLengthShiftCount;
+
+				if (NameLen == 0)
+				{
+					const int32 EntryIdOffset = Off::FNameEntry::NamePool::StringOffset + ((Off::FNameEntry::NamePool::StringOffset == 6) * 2);
+					const int32 NextEntryIndex = LocalRead32(local + EntryIdOffset);
+					const int32 Number = LocalRead32(local + EntryIdOffset + sizeof(int32));
+					if (NextEntryIndex <= 0 || NextEntryIndex > 0x04000000)
+						return L"";
+					if (Number > 0 && Number < 0x100000)
+						return NameArray::GetNameEntry(NextEntryIndex).GetWString() + L'_' + std::to_wstring(Number - 1);
+					return NameArray::GetNameEntry(NextEntryIndex).GetWString();
+				}
+
+				const int32 clampedLen = (NameLen > 0x400) ? 0x400 : (NameLen < 0 ? 0 : NameLen);
+				if (clampedLen == 0)
+					return L"";
+				const uint8_t* stringLocal = local + Off::FNameEntry::NamePool::StringOffset;
+
+				if (HeaderWithoutNumber & NameWideMask)
+				{
+					return std::wstring(reinterpret_cast<const wchar_t*>(stringLocal), clampedLen);
+				}
+				thread_local std::string narrowScratch;
+				narrowScratch.assign(reinterpret_cast<const char*>(stringLocal), clampedLen);
+				return UtfN::StringToWString(narrowScratch);
+			}
+
+			// Slow path: entry falls outside the cache (shouldn't happen once NamePool cache
+			// is populated, but we keep it for manual overrides / malformed CR3 states).
 			const uint16 HeaderWithoutNumber = RDeref<uint16>(NameEntry + Off::FNameEntry::NamePool::HeaderOffset);
 			const int32 NameLen = HeaderWithoutNumber >> FNameEntry::FNameEntryLengthShiftCount;
 
@@ -109,8 +256,6 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 				const int32 NextEntryIndex = RDeref<int32>(NameEntry + EntryIdOffset);
 				const int32 Number = RDeref<int32>(NameEntry + EntryIdOffset + sizeof(int32));
 
-				// Sanity check NextEntryIndex: must be within FNamePool's valid range. Garbage
-				// reads (paged-out pool) frequently produce huge or negative indices.
 				if (NextEntryIndex <= 0 || NextEntryIndex > 0x04000000)
 					return L"";
 
@@ -120,17 +265,11 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 				return NameArray::GetNameEntry(NextEntryIndex).GetWString();
 			}
 
-			// Sanity clamp to avoid huge reads on corrupt pointers.
 			const int32 clampedLen = (NameLen > 0x400) ? 0x400 : (NameLen < 0 ? 0 : NameLen);
 			if (clampedLen == 0)
 				return L"";
 			const uintptr_t stringAddr = reinterpret_cast<uintptr_t>(NameEntry) + Off::FNameEntry::NamePool::StringOffset;
 
-			// Reusable thread-local buffers to avoid allocating per call. Per-iteration
-			// 1..2 KB wstring allocations were causing working-set growth via heap
-			// fragmentation: malloc/free pairs leave a fragmented free list that Windows
-			// won't return to the OS, so 100 k iterations of Object.GetName() pushed RSS
-			// into the GB range on 117 k-object games.
 			thread_local std::vector<wchar_t> wideBuf;
 			thread_local std::vector<char> narrowBuf;
 
@@ -343,17 +482,42 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 		const int32 ChunkIdx = ComparisonIndex >> NamePoolBlockOffsetBits;
 		const int32 InChunkOffset = (ComparisonIndex & ((1 << NamePoolBlockOffsetBits) - 1)) * NameEntryStride;
 
-		const bool bIsBeyondLastChunk = ChunkIdx == NameArray::GetNumChunks() && InChunkOffset > NameArray::GetByteCursor();
+		// Use cached {NumChunks, ByteCursor, ChunkBase} when available to avoid 3 hypercalls per
+		// ByIndex. On a FindObjectFast miss against 117k UObjects that saves ~351k hypercalls.
+		const int32 cachedNumChunks   = NameArray::GetCachedNumChunks();
+		const int32 cachedByteCursor  = NameArray::GetCachedByteCursor();
+		const int32 numChunksForCheck = cachedNumChunks >= 0 ? cachedNumChunks : NameArray::GetNumChunks();
+		const int32 byteCursorForCheck = cachedByteCursor >= 0 ? cachedByteCursor : NameArray::GetByteCursor();
 
-		if (ChunkIdx < 0 || ChunkIdx > GetNumChunks() || bIsBeyondLastChunk)
+		if (ChunkIdx < 0 || ChunkIdx > numChunksForCheck)
+			return nullptr;
+		if (ChunkIdx == numChunksForCheck && InChunkOffset > byteCursorForCheck)
 			return nullptr;
 
-		const uintptr_t chunkArrayAddr = reinterpret_cast<uintptr_t>(NamesArray) + 0x10;
-		const uintptr_t chunkBase = RDeref<uintptr_t>(chunkArrayAddr + ChunkIdx * sizeof(void*));
+		const uintptr_t cachedBase = NameArray::GetCachedChunkBase(ChunkIdx);
+		const uintptr_t chunkBase = cachedBase != 0
+			? cachedBase
+			: RDeref<uintptr_t>(reinterpret_cast<uintptr_t>(NamesArray) + 0x10 + ChunkIdx * sizeof(void*));
 		return reinterpret_cast<void*>(chunkBase + InChunkOffset);
 	};
 
 	Settings::Internal::bUseNamePool = true;
+
+	// Populate the FNamePool chunk cache BEFORE FNameEntry::Init so that GetStr's fast path
+	// is ready for the first FName resolution (which happens during Init's shift-count probe).
+	{
+		const int32 NumChunks = RDeref<int32>(NamePool + Off::NameArray::MaxChunkIndex) + 1;
+		const int32 ByteCursor = RDeref<int32>(NamePool + Off::NameArray::ByteCursor);
+		// FNameBlockOffsetBits defaults to 0x10 (16) at this point; PostInit refines it later.
+		// The cache is sized for the default bits; if PostInit bumps bits we extend below.
+		NameArray::PopulateFNamePoolCache(
+			reinterpret_cast<uintptr_t>(NamePool),
+			NumChunks,
+			static_cast<int32>(NameArray::FNameBlockOffsetBits),
+			static_cast<int32>(NameEntryStride),
+			ByteCursor);
+	}
+
 	FNameEntry::Init(reinterpret_cast<uint8*>(chunkPtrRemoteAddr), FNameEntryHeaderSize);
 
 	return true;
@@ -627,37 +791,80 @@ void NameArray::PostInit()
 {
 	if (GNames && Settings::Internal::bUseNamePool)
 	{
-		NameArray::FNameBlockOffsetBits = 0xE;
-
-		int i = ObjectArray::Num();
-		while (i >= 0)
+		// Primary: derive bits from the FNamePool structure itself. ByteCursor tells us how many
+		// bytes have been allocated in the CURRENT (last) chunk — that's always <= ChunkSize, and
+		// ChunkSize = (1 << bits) * NameEntryStride. So the smallest bits that makes
+		// (1 << bits) * stride >= ByteCursor is the right one.
+		//
+		// The legacy algorithm (iterate UObjects, find one whose CompIdx/2^bits == NumChunks-1) is
+		// brittle when no UObject actually references a name from the LAST chunk of the pool — in
+		// that case it converges on an undershooting bits value that leaves ByteCursor pointing
+		// past the end of a "cached" chunk and every FName lookup for a higher-CompIdx name
+		// resolves to garbage bytes in the next chunk's allocation.
+		const int32 ByteCursor = GetByteCursor();
+		if (ByteCursor > 0 && NameEntryStride > 0)
 		{
-			const int32 CurrentBlock = NameArray::GetNumChunks();
-
-			UEObject Obj = ObjectArray::GetByIndex(i);
-
-			if (!Obj)
+			int32 bits = 0x8;
+			while (bits < 0x18)
 			{
+				const int64 chunkSize = static_cast<int64>(1ULL << bits) * static_cast<int64>(NameEntryStride);
+				if (chunkSize >= ByteCursor)
+					break;
+				++bits;
+			}
+			NameArray::FNameBlockOffsetBits = bits;
+			std::cerr << std::format(
+				"[NameArray] PostInit: bits={} (derived from ByteCursor=0x{:X} stride={})\n",
+				NameArray::FNameBlockOffsetBits, ByteCursor, NameEntryStride);
+		}
+		else
+		{
+			// Fallback to the legacy UObject-walking algorithm if ByteCursor wasn't discovered.
+			NameArray::FNameBlockOffsetBits = 0xE;
+
+			int i = ObjectArray::Num();
+			while (i >= 0)
+			{
+				const int32 CurrentBlock = NameArray::GetNumChunks();
+
+				UEObject Obj = ObjectArray::GetByIndex(i);
+
+				if (!Obj)
+				{
+					i--;
+					continue;
+				}
+
+				const int32 ObjNameChunkIdx = Obj.GetFName().GetCompIdx() >> NameArray::FNameBlockOffsetBits;
+
+				if (ObjNameChunkIdx == CurrentBlock)
+					break;
+
+				if (ObjNameChunkIdx > CurrentBlock)
+				{
+					NameArray::FNameBlockOffsetBits++;
+					i = ObjectArray::Num();
+				}
+
 				i--;
-				continue;
 			}
-
-			const int32 ObjNameChunkIdx = Obj.GetFName().GetCompIdx() >> NameArray::FNameBlockOffsetBits;
-
-			if (ObjNameChunkIdx == CurrentBlock)
-				break;
-
-			if (ObjNameChunkIdx > CurrentBlock)
-			{
-				NameArray::FNameBlockOffsetBits++;
-				i = ObjectArray::Num();
-			}
-
-			i--;
 		}
 		Off::InSDK::NameArray::FNamePoolBlockOffsetBits = NameArray::FNameBlockOffsetBits;
 
 		std::cerr << "NameArray::FNameBlockOffsetBits: 0x" << std::hex << NameArray::FNameBlockOffsetBits << "\n" << std::endl;
+
+		// Repopulate the FNamePool chunk cache now that the real block-offset bits are known.
+		// The initial cache (built in InitializeNamePool) assumed the default bits; if PostInit
+		// bumped them, the chunks are larger than we sized for and entries past the old size
+		// would fall through to the slow path on every lookup.
+		const int32 FinalNumChunks = GetNumChunks() + 1;
+		const int32 FinalByteCursor = GetByteCursor();
+		PopulateFNamePoolCache(
+			reinterpret_cast<uintptr_t>(GNames),
+			FinalNumChunks,
+			static_cast<int32>(NameArray::FNameBlockOffsetBits),
+			static_cast<int32>(NameEntryStride),
+			FinalByteCursor);
 	}
 }
 
