@@ -55,13 +55,15 @@ class StructManager;
 class StructInfoHandle
 {
 private:
-	const StructInfo* Info;
+	const StructInfo* Info = nullptr;
 
 public:
 	StructInfoHandle() = default;
 	StructInfoHandle(const StructInfo& InInfo);
 
 public:
+	bool IsValidHandle() const { return Info != nullptr; }
+
 	int32 GetLastMemberEnd() const;
 	int32 GetSize() const;
 	int32 GetUnalignedSize() const;
@@ -131,7 +133,10 @@ public:
 		if (!Struct)
 			return {};
 
-		return StructInfoOverrides.at(Struct.GetIndex());
+		auto It = StructInfoOverrides.find(Struct.GetIndex());
+		if (It == StructInfoOverrides.end())
+			return {};
+		return It->second;
 	}
 
 	static inline bool IsStructCyclicWithPackage(int32 StructIndex, int32 PackageIndex)
@@ -143,15 +148,18 @@ public:
 		return false;
 	}
 
-	/* 
+	/*
 	* Utility function for PackageManager::PostInit to handle the initialization of our list of cyclic structs and their respective packages
-	* 
+	*
 	* Marks StructInfo as 'bIsPartOfCyclicPackage = true' and adds struct to 'CyclicStructsAndPackages'
 	*/
 	static inline void PackageManagerSetCycleForStruct(int32 StructIndex, int32 PackageIndex)
 	{
-		StructInfo& Info = StructInfoOverrides.at(StructIndex);
+		auto It = StructInfoOverrides.find(StructIndex);
+		if (It == StructInfoOverrides.end())
+			return;
 
+		StructInfo& Info = It->second;
 		Info.bIsPartOfCyclicPackage = true;
 
 

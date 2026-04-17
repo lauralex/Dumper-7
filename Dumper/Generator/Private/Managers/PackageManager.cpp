@@ -5,6 +5,8 @@
 /* Required for marking cyclic-headers in the StructManager */
 #include "Managers/StructManager.h"
 
+#include <iostream>
+
 inline void BooleanOrEqual(bool& b1, bool b2)
 {
 	b1 = b1 || b2;
@@ -122,21 +124,37 @@ void PackageInfoHandle::ErasePackageDependencyFromClasses(int32 Package) const
 
 namespace PackageManagerUtils
 {
+	// Reject indices that obviously can't be real UObjects — nulls, negatives, or out-of-range.
+	// On stripped/paged-out targets, FField reads return zero, so UEStructProperty::
+	// GetUnderlayingStruct() can hand back a UEObject wrapping nullptr; its GetIndex() then
+	// reads from VA 0x0C and returns 0. Index 0 is a valid UObject (usually CoreUObject
+	// package), which poisons the dep graph with false self-dependencies. Guard at the
+	// insertion site so the graph stays clean even before the post-prune pass runs.
+	static inline void InsertValidDepIndex(std::unordered_set<int32>& Store, UEObject Obj)
+	{
+		if (!Obj)
+			return;
+		const int32 Idx = Obj.GetIndex();
+		if (Idx <= 0 || Idx >= ObjectArray::Num())
+			return;
+		Store.insert(Idx);
+	}
+
 	void GetPropertyDependency(UEProperty Prop, std::unordered_set<int32>& Store)
 	{
 		if (Prop.IsA(EClassCastFlags::StructProperty))
 		{
-			Store.insert(Prop.Cast<UEStructProperty>().GetUnderlayingStruct().GetIndex());
+			InsertValidDepIndex(Store, Prop.Cast<UEStructProperty>().GetUnderlayingStruct());
 		}
 		else if (Prop.IsA(EClassCastFlags::EnumProperty))
 		{
 			if (UEObject Enum = Prop.Cast<UEEnumProperty>().GetEnum())
-				Store.insert(Enum.GetIndex());
+				InsertValidDepIndex(Store, Enum);
 		}
 		else if (Prop.IsA(EClassCastFlags::ByteProperty))
 		{
 			if (UEObject Enum = Prop.Cast<UEByteProperty>().GetEnum())
-				Store.insert(Enum.GetIndex());
+				InsertValidDepIndex(Store, Enum);
 		}
 		else if (Prop.IsA(EClassCastFlags::ArrayProperty))
 		{
@@ -323,13 +341,80 @@ void PackageManager::InitDependencies()
 			Info.Enums.push_back(Obj.GetIndex());
 		}
 	}
+
+	// Prune dependency keys that don't resolve to a real PackageInfos entry.
+	//
+	// On reflection-stripped targets (EAC / protected UE5), ChildProperties/FField pages are
+	// paged out — UEStructProperty::GetUnderlayingStruct etc. read back zero-filled or
+	// garbage, so GetDependencies() can accumulate indices that resolve to an "outermost"
+	// package we never created an info for. Downstream IterateDependenciesImplementation
+	// calls PackageInfos.at(RequiredPackage) and throws `invalid unordered_map<K, T> key`,
+	// killing the CppGenerator / MappingGenerator / DumpspaceGenerator backends.
+	//
+	// Single-pass prune catches garbage from *any* source (paged-out FField, bad Super
+	// walks, chain corruption) without spreading the predicate across every insertion path.
+	// We log the first occurrence to keep the diagnostic visible without flooding on every
+	// bad entry.
+	{
+		bool bLoggedFirst = false;
+		auto LogFirstBadKey = [&bLoggedFirst](int32 OwningPackageIdx, int32 BadPackageIdx, const char* DepBucket)
+		{
+			if (bLoggedFirst)
+				return;
+			bLoggedFirst = true;
+
+			std::string OwningName = "<unknown>";
+			if (auto Owner = ObjectArray::GetByIndex(OwningPackageIdx))
+				OwningName = Owner.GetValidName();
+
+			std::string BadName = "<unknown>";
+			if (auto Bad = ObjectArray::GetByIndex(BadPackageIdx))
+				BadName = Bad.GetValidName();
+
+			std::cerr << "[PackageManager] pruning missing dep key: OwningPackage=" << OwningPackageIdx
+				<< " (" << OwningName << ")"
+				<< " BadDepPackage=" << BadPackageIdx
+				<< " (" << BadName << ")"
+				<< " bucket=" << DepBucket << "\n";
+		};
+
+		auto PruneList = [&](DependencyListType& Deps, int32 OwningPackageIdx, const char* DepBucket)
+		{
+			for (auto It = Deps.begin(); It != Deps.end(); )
+			{
+				if (!PackageInfos.contains(It->first))
+				{
+					LogFirstBadKey(OwningPackageIdx, It->first, DepBucket);
+					It = Deps.erase(It);
+				}
+				else
+				{
+					++It;
+				}
+			}
+		};
+
+		for (auto& [OwningPackageIdx, Info] : PackageInfos)
+		{
+			PruneList(Info.PackageDependencies.StructsDependencies,    OwningPackageIdx, "structs");
+			PruneList(Info.PackageDependencies.ClassesDependencies,    OwningPackageIdx, "classes");
+			PruneList(Info.PackageDependencies.ParametersDependencies, OwningPackageIdx, "parameters");
+		}
+	}
 }
 
 void PackageManager::InitNames()
 {
 	for (auto& [PackageIdx, Info] : PackageInfos)
 	{
-		const std::string PackageName = ObjectArray::GetByIndex(PackageIdx).GetValidName();
+		std::string PackageName = ObjectArray::GetByIndex(PackageIdx).GetValidName();
+
+		// Stripped / paged-out packages sometimes read back with empty names. HashStringTable::
+		// FindOrAdd rejects empty strings with a Length<=0 error and leaves Info.Name at -1,
+		// which then crashes downstream lookups. Synthesize a stable placeholder so the
+		// package still has a usable identifier in the generated SDK.
+		if (PackageName.empty())
+			PackageName = "UnnamedPackage_" + std::to_string(PackageIdx);
 
 		auto [Name, bWasInserted] = UniquePackageNameTable.FindOrAdd(PackageName);
 		Info.Name = Name;
@@ -408,7 +493,14 @@ void PackageManager::HelperAddEnumsFromPacakageToFwdDeclarations(UEStruct Struct
 
 void PackageManager::HelperInitEnumFwdDeclarationsForPackage(int32 PackageForFwdDeclarations, int32 RequiredPackage, bool bIsClass)
 {
-	PackageInfo& Info = PackageInfos.at(PackageForFwdDeclarations);
+	// Defensive: the cycle handler feeds us Cycle.CurrentPackage from the dep graph, and
+	// although the prune pass in InitDependencies removes unknown keys at population time,
+	// HandleCycles mutates dependencies while iterating. Skip gracefully instead of throwing.
+	auto It = PackageInfos.find(PackageForFwdDeclarations);
+	if (It == PackageInfos.end())
+		return;
+
+	PackageInfo& Info = It->second;
 
 	std::vector<std::pair<int32, bool>>& EnumsToForwardDeclare = Info.EnumForwardDeclarations;
 
@@ -466,6 +558,8 @@ void PackageManager::HandleCycles()
 
 		const PackageInfoHandle CurrentPackageInfo = GetInfo(CurrentPackageIndex);
 		const PackageInfoHandle PreviousPackageInfo = GetInfo(PreviousPackageIndex);
+		if (!CurrentPackageInfo.IsValidHandle() || !PreviousPackageInfo.IsValidHandle())
+			return;
 
 		const DependencyManager& CurrentStructsOrClasses = bIsStruct ? CurrentPackageInfo.GetSortedStructs() : CurrentPackageInfo.GetSortedClasses();
 		const DependencyManager& PreviousStructsOrClasses = bIsStruct ? PreviousPackageInfo.GetSortedStructs() : PreviousPackageInfo.GetSortedClasses();
@@ -545,6 +639,8 @@ void PackageManager::HandleCycles()
 	{
 		const PackageInfoHandle CurrentPackageInfo = GetInfo(Cycle.CurrentPackage);
 		const PackageInfoHandle PreviousPackageInfo = GetInfo(Cycle.PreviousPacakge);
+		if (!CurrentPackageInfo.IsValidHandle() || !PreviousPackageInfo.IsValidHandle())
+			continue;
 
 		/* Add enum forward declarations to the package from which we remove the dependency, as enums are not considered by those dependencies */
 		HelperInitEnumFwdDeclarationsForPackage(Cycle.CurrentPackage, Cycle.PreviousPacakge, Cycle.bAreStructsCyclic);
@@ -555,7 +651,16 @@ void PackageManager::HandleCycles()
 			continue;
 		}
 
-		const RequirementInfo& CurrentRequirements = CurrentPackageInfo.GetPackageDependencies().ClassesDependencies.at(Cycle.CurrentPackage);
+		// The cycle handler stashed (CurrentPackage, PreviousPackage) into HandledPackages
+		// during FindCycle; by the time we get here, earlier iterations of this loop may
+		// have already erased entries, or the dep graph may have been pruned. Fall back
+		// cleanly if the key isn't present rather than throwing `invalid unordered_map key`.
+		const auto& ClassesDeps = CurrentPackageInfo.GetPackageDependencies().ClassesDependencies;
+		auto CurrReqIt = ClassesDeps.find(Cycle.CurrentPackage);
+		if (CurrReqIt == ClassesDeps.end())
+			continue;
+
+		const RequirementInfo& CurrentRequirements = CurrReqIt->second;
 
 		/* Mark classes as 'do not include' when this package is cyclic but can still require _structs.hpp */
 		if (CurrentRequirements.bShouldIncludeStructs)
@@ -646,7 +751,14 @@ void PackageManager::IterateDependenciesImplementation(const PackageManagerItera
 		.VisitedNodes = Params.VisitedNodes,
 	};
 
-	DependencyInfo& Dependencies = PackageInfos.at(Params.RequiredPackage).PackageDependencies;
+	// Belt-and-suspenders against the prune pass missing something: if a downstream
+	// dep index doesn't resolve to a package info entry, just stop recursing there
+	// rather than throwing out of the middle of a traversal.
+	auto PkgIt = PackageInfos.find(Params.RequiredPackage);
+	if (PkgIt == PackageInfos.end())
+		return;
+
+	DependencyInfo& Dependencies = PkgIt->second.PackageDependencies;
 
 	SingleDependencyIterationParamsInternal StructsParams{
 		.CallbackForEachPackage = CallbackForEachPackage,

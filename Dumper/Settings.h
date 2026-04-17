@@ -113,6 +113,11 @@ R"(
 
 		/* Prints debug information during Mapping-Generation */
 		inline constexpr bool bShouldPrintMappingDebugData = false;
+
+		/* Skip emitting GObjects-Dump-WithProperties.txt. In external mode the per-property
+		 * walk makes ~10M hypercalls and accumulates GB of std::format temporaries on
+		 * stripped-reflection targets; the file is only a diagnostic aid. */
+		inline constexpr bool bSkipPropertyDump = true;
 	}
 
 	//* * * * * * * * * * * * * * * * * * * * *// 

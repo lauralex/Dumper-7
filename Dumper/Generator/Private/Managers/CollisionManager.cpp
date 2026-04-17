@@ -234,10 +234,17 @@ void CollisionManager::AddStructToNameContainer(UEStruct Struct, bool bIsStruct)
 
 	auto AddToContainerAndTranslationMap = [&](auto Member, ECollisionType CollisionType, bool bIsStruct, UEFunction Func = nullptr) -> void
 	{
-		const uint64 Index = AddNameToContainer(StructNames, Struct, MemberNames.FindOrAdd(Member.GetValidName()), CollisionType, bIsStruct, Func);
+		// Stripped-reflection targets return empty names for FField-backed members.
+		// FindOrAdd would produce index=-1 and crash downstream GetStringEntry() calls,
+		// so synthesize a per-struct-per-member placeholder instead.
+		std::string MemberName = Member.GetValidName();
+		if (MemberName.empty())
+			MemberName = "UnnamedMember_" + std::to_string(KeyFunctions::GetKeyForCollisionInfo(Struct, Member));
+
+		const uint64 Index = AddNameToContainer(StructNames, Struct, MemberNames.FindOrAdd(MemberName), CollisionType, bIsStruct, Func);
 
 		const auto [It, bInserted] = TranslationMap.emplace(KeyFunctions::GetKeyForCollisionInfo(Struct, Member), Index);
-		
+
 		if (!bInserted)
 			std::cerr << "Error, no insertion took place, key {0x" << std::hex << KeyFunctions::GetKeyForCollisionInfo(Struct, Member) << "} duplicated!" << std::endl;
 	};

@@ -68,13 +68,15 @@ public:
 class EnumInfoHandle
 {
 private:
-	const EnumInfo* Info;
+	const EnumInfo* Info = nullptr;
 
 public:
 	EnumInfoHandle() = default;
 	EnumInfoHandle(const EnumInfo& InInfo);
 
 public:
+	bool IsValidHandle() const { return Info != nullptr; }
+
 	uint8 GetUnderlyingTypeSize() const;
 	const StringEntry& GetName() const;
 
@@ -143,7 +145,10 @@ public:
 		if (!Enum)
 			return {};
 
-		return EnumInfoOverrides.at(Enum.GetIndex());
+		auto It = EnumInfoOverrides.find(Enum.GetIndex());
+		if (It == EnumInfoOverrides.end())
+			return {};
+		return It->second;
 	}
 };
 

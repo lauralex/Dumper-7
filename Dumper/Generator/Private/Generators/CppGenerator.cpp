@@ -1201,12 +1201,44 @@ std::unordered_map<std::string, UEProperty> CppGenerator::GetUnknownProperties()
 		if (!Obj.IsA(EClassCastFlags::Struct))
 			continue;
 
+		// Skip properties whose backing FField is unreadable: on stripped-reflection targets
+		// the ChildProperties chain can start at a non-null but paged-out VA, and reading
+		// through it produces zero-filled fields plus a downstream access violation once
+		// GetMemberTypeStringWithoutConst chases a garbage pointer.
 		for (UEProperty Prop : Obj.Cast<UEStruct>().GetProperties())
 		{
-			bool bIsUnknownProperty = false;
-			const std::string TypeName = GetMemberTypeStringWithoutConst(Prop, -1, &bIsUnknownProperty);
+			if (!Prop || !Prop.GetAddress())
+				continue;
 
-			if (bIsUnknownProperty)
+			// Reject obviously-bogus Base pointers before dereferencing them.
+			const uintptr_t base = reinterpret_cast<uintptr_t>(Prop.GetAddress());
+			if (base < 0x10000 || base >= 0x0000800000000000ULL)
+				continue;
+
+			// Require a resolvable FField Class with non-zero CastFlags. On stripped
+			// targets the Class pointer reads back as zero (paged out); every property
+			// then lands in the "unknown" branch of GetMemberTypeStringWithoutConst, and
+			// we'd insert a synthetic per-property TypeName into the map (millions of
+			// entries, GBs of strings) before returning. No meaningful type info without
+			// the class, so skip.
+			auto [PropClass, PropFieldClass] = Prop.GetClass();
+			const EClassCastFlags CastFlags = PropClass ? PropClass.GetCastFlags()
+				: PropFieldClass.GetCastFlags();
+			if (CastFlags == EClassCastFlags::None)
+				continue;
+
+			bool bIsUnknownProperty = false;
+			std::string TypeName;
+			try
+			{
+				TypeName = GetMemberTypeStringWithoutConst(Prop, -1, &bIsUnknownProperty);
+			}
+			catch (...)
+			{
+				continue;
+			}
+
+			if (bIsUnknownProperty && !TypeName.empty())
 				PropertiesWithNames[TypeName] = Prop;
 		}
 	}
@@ -1413,6 +1445,8 @@ void CppGenerator::GenerateSDKHeader(StreamType& SdkHpp)
 	auto ForEachElementCallback = [&SdkHpp](const PackageManagerIterationParams& OldParams, const PackageManagerIterationParams& NewParams, bool bIsStruct) -> void
 	{
 		PackageInfoHandle CurrentPackage = PackageManager::GetInfo(NewParams.RequiredPackage);
+		if (!CurrentPackage.IsValidHandle())
+			return;
 
 		const bool bHasClassesFile = CurrentPackage.HasClasses();
 		const bool bHasStructsFile = (CurrentPackage.HasStructs() || CurrentPackage.HasEnums());

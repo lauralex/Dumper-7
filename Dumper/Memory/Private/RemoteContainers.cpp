@@ -13,7 +13,22 @@ namespace RemoteContainers
 
 	bool TArrayHeader::IsValid() const
 	{
-		return Data != 0 && Num > 0 && Max >= Num;
+		// Sanity cap: Unreal's TArrays in the metadata paths we walk (enum name/value pairs,
+		// TMap<FName, FString> editor metadata, TArray<FImplementedInterface>, etc.) are small.
+		// A Num in the hundreds of thousands is already suspicious; millions means we read
+		// garbage (uninitialised FField memory on stripped targets). Treating such headers
+		// as invalid prevents us from reserve()-ing gigabytes and either OOM-ing or spending
+		// minutes on hypercalls to validate a ghost buffer.
+		constexpr int32_t kMaxSaneNum = 1 << 20; // 1 million
+		if (Data == 0 || Num <= 0 || Max < Num)
+			return false;
+		if (Num > kMaxSaneNum)
+			return false;
+		// Reject obvious non-userspace pointers (below 0x10000 is never heap, above canonical
+		// userspace upper bound is kernel memory we can't read anyway).
+		if (Data < 0x10000 || Data >= 0x0000800000000000ULL)
+			return false;
+		return true;
 	}
 
 	TArrayHeader ReadTArrayHeader(uintptr_t remoteHeaderAddr)
@@ -78,6 +93,12 @@ namespace RemoteContainers
 
 		const int32_t numBits = raw->NumBits;
 		if (numBits <= 0)
+			return bits;
+
+		// Same sanity cap as TArrayHeader: FBitArray on stripped-reflection targets can read
+		// back with gigantic NumBits and we'd allocate GB of zeros for no reason.
+		constexpr int32_t kMaxSaneBits = 1 << 22; // 4 million bits
+		if (numBits > kMaxSaneBits)
 			return bits;
 
 		const int32_t numWords = (numBits + 31) >> 5;

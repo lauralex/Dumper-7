@@ -6,49 +6,57 @@ StructInfoHandle::StructInfoHandle(const StructInfo& InInfo)
 {
 }
 
+// All accessors guard against Info==nullptr. On stripped-reflection targets
+// StructManager::GetInfo() returns a null handle for structs that weren't registered
+// during InitAlignmentsAndNames (e.g. garbage refs from paged-out FField data); callers
+// previously assumed Info was non-null and would crash with access violations.
+
 int32 StructInfoHandle::GetLastMemberEnd() const
 {
-	return Info->LastMemberEnd;
+	return Info ? Info->LastMemberEnd : 0x0;
 }
 
 int32 StructInfoHandle::GetSize() const
 {
-	return Align(Info->Size, Info->Alignment);
+	if (!Info)
+		return 0x0;
+	return Align(Info->Size, Info->Alignment > 0 ? Info->Alignment : 1);
 }
 
 int32 StructInfoHandle::GetUnalignedSize() const
 {
-	return Info->Size;
+	return Info ? Info->Size : 0x0;
 }
 
 int32 StructInfoHandle::GetAlignment() const
 {
-	return Info->Alignment;
+	return Info ? Info->Alignment : static_cast<int32>(alignof(void*));
 }
 
 bool StructInfoHandle::ShouldUseExplicitAlignment() const
 {
-	return Info->bUseExplicitAlignment;
+	return Info && Info->bUseExplicitAlignment;
 }
 
 const StringEntry& StructInfoHandle::GetName() const
 {
+	// Caller must first check IsValidHandle(); StringEntry has no null variant.
 	return StructManager::GetName(*Info);
 }
 
 bool StructInfoHandle::IsFinal() const
 {
-	return Info->bIsFinal;
+	return Info && Info->bIsFinal;
 }
 
 bool StructInfoHandle::HasReusedTrailingPadding() const
 {
-	return Info->bHasReusedTrailingPadding;
+	return Info && Info->bHasReusedTrailingPadding;
 }
 
 bool StructInfoHandle::IsPartOfCyclicPackage() const
 {
-	return Info->bIsPartOfCyclicPackage;
+	return Info && Info->bIsPartOfCyclicPackage;
 }
 
 void StructManager::InitAlignmentsAndNames()
@@ -77,6 +85,14 @@ void StructManager::InitAlignmentsAndNames()
 		StructInfo& NewOrExistingInfo = StructInfoOverrides[ObjAsStruct.GetIndex()];
 
 		std::string CppName = ObjAsStruct.GetCppName();
+
+		// Stripped-reflection targets can produce structs whose CppName resolves to empty
+		// (FName data read as zero because of paged-out FField / stripped name). An empty
+		// name hands HashStringTable::FindOrAdd a Length<=0 string, which returns -1 and
+		// crashes the downstream UniqueNameTable[-1] access. Substitute a unique placeholder
+		// so the struct at least appears in the generated SDK with an obvious name.
+		if (CppName.empty())
+			CppName = "UnnamedStruct_" + std::to_string(ObjAsStruct.GetIndex());
 
 		// Hardcoded fix for two 'UOnlineEngineInterfaceImpl' classes in the same package. Check will only match one of them.
 		if (ObjAsStruct == OnlineEngineInterfaceImplClass) [[unlikely]]

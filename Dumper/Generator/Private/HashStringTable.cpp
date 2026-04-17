@@ -1,5 +1,9 @@
 #include "HashStringTable.h"
 
+#include <atomic>
+#include <format>
+#include <iostream>
+
 
 #pragma warning(suppress: 26495)
 HashStringTable::HashStringTable(uint32 InitialBucketSize)
@@ -169,7 +173,19 @@ inline std::pair<HashStringTableIndex, bool> HashStringTable::FindOrAdd(const Ch
 
     if (!Str || Length <= 0 || Length > StringEntry::MaxStringLength)
     {
-        std::cerr << std::format("Error on line {{{:d}}}: {}\n", __LINE__, !Str ? "!Str" : Length <= 0 ? "Length <= 0" : "Length > MaxStringLength") << std::endl;
+        // Rate-limit the log: on stripped-reflection targets FField reads return zeros, so
+        // empty/invalid names flood here by the thousand. The return is already handled by
+        // callers via HashStringTableIndex(-1); the log was purely diagnostic and its
+        // unbounded stderr writes themselves became a perf / memory pressure problem.
+        static std::atomic<uint32_t> s_BadCount{0};
+        const uint32_t Count = s_BadCount.fetch_add(1, std::memory_order_relaxed);
+        if (Count < 8 || (Count & (Count - 1)) == 0) // first 8, then powers of 2
+        {
+            std::cerr << std::format("Error on line {{{:d}}}: {} (occurrence #{})\n",
+                __LINE__,
+                !Str ? "!Str" : Length <= 0 ? "Length <= 0" : "Length > MaxStringLength",
+                Count + 1) << std::endl;
+        }
         return { HashStringTableIndex(-1), false };
     }
 

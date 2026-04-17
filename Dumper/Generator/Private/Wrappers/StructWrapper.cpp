@@ -49,6 +49,15 @@ std::pair<std::string, bool> StructWrapper::GetUniqueName() const
 {
     if (bIsUnrealStruct)
     {
+        // If StructManager didn't track this struct (e.g. a garbage dep that survived the
+        // dep-prune because it happened to reference a real UObject index that wasn't a
+        // struct, or the struct was synthesised from corrupted FField data), InfoHandle is
+        // a null wrapper and InfoHandle.GetName() would dereference a null StructInfo*.
+        // Fall back to the UEStruct's own name; it's at least internally consistent even
+        // if it doesn't match the managed-uniqueness invariant.
+        if (!InfoHandle.IsValidHandle())
+            return { Struct ? Struct.GetValidName() : std::string("UnknownStruct"), true };
+
         const auto& StringEntry = InfoHandle.GetName();
 
         return { StringEntry.GetName(), StringEntry.IsUnique() };
@@ -59,37 +68,49 @@ std::pair<std::string, bool> StructWrapper::GetUniqueName() const
 
 int32 StructWrapper::GetLastMemberEnd() const
 {
-    return bIsUnrealStruct ? InfoHandle.GetLastMemberEnd() : 0x0;
+    if (bIsUnrealStruct)
+        return InfoHandle.IsValidHandle() ? InfoHandle.GetLastMemberEnd() : 0x0;
+    return 0x0;
 }
 
 int32 StructWrapper::GetAlignment() const
 {
-    return bIsUnrealStruct ? InfoHandle.GetAlignment() : PredefStruct->Alignment;
+    if (bIsUnrealStruct)
+        return InfoHandle.IsValidHandle() ? InfoHandle.GetAlignment() : alignof(void*);
+    return PredefStruct->Alignment;
 }
 
 int32 StructWrapper::GetSize() const
 {
-    return bIsUnrealStruct ? InfoHandle.GetSize() : Align(PredefStruct->Size, PredefStruct->Alignment);
+    if (bIsUnrealStruct)
+        return InfoHandle.IsValidHandle() ? InfoHandle.GetSize() : 0x0;
+    return Align(PredefStruct->Size, PredefStruct->Alignment);
 }
 
 int32 StructWrapper::GetUnalignedSize() const
 {
-    return bIsUnrealStruct ? InfoHandle.GetUnalignedSize() : PredefStruct->Size;
+    if (bIsUnrealStruct)
+        return InfoHandle.IsValidHandle() ? InfoHandle.GetUnalignedSize() : 0x0;
+    return PredefStruct->Size;
 }
 
 bool StructWrapper::ShouldUseExplicitAlignment() const
 {
-    return bIsUnrealStruct ? InfoHandle.ShouldUseExplicitAlignment() : PredefStruct->bUseExplictAlignment;
+    if (bIsUnrealStruct)
+        return InfoHandle.IsValidHandle() && InfoHandle.ShouldUseExplicitAlignment();
+    return PredefStruct->bUseExplictAlignment;
 }
 
 bool StructWrapper::HasReusedTrailingPadding() const
 {
-    return bIsUnrealStruct && InfoHandle.HasReusedTrailingPadding();
+    return bIsUnrealStruct && InfoHandle.IsValidHandle() && InfoHandle.HasReusedTrailingPadding();
 }
 
 bool StructWrapper::IsFinal() const
 {
-    return bIsUnrealStruct ? InfoHandle.IsFinal() : PredefStruct->bIsFinal;
+    if (bIsUnrealStruct)
+        return InfoHandle.IsValidHandle() && InfoHandle.IsFinal();
+    return PredefStruct->bIsFinal;
 }
 
 bool StructWrapper::IsClass() const
@@ -136,7 +157,7 @@ bool StructWrapper::IsCyclicWithPackage(int32 PackageIndex) const
     if (!bIsUnrealStruct || PackageIndex == -1)
         return false;
 
-    if (!InfoHandle.IsPartOfCyclicPackage())
+    if (!InfoHandle.IsValidHandle() || !InfoHandle.IsPartOfCyclicPackage())
         return false;
 
     return StructManager::IsStructCyclicWithPackage(Struct.GetIndex(), PackageIndex);

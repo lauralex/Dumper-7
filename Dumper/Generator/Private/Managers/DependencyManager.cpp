@@ -27,7 +27,15 @@ size_t DependencyManager::GetNumEntries() const
 
 void DependencyManager::VisitIndexAndDependencies(int32 Index, OnVisitCallbackType Callback) const
 {
-	auto& [IterationHitCounter, Dependencies] = AllDependencies.at(Index);
+	// On stripped-reflection targets the dep graph can reference indices that never got
+	// their own SetExists() call (garbage from FField zero-reads that happened to pass
+	// the same-package check in AddStructDependencies). Skip gracefully rather than
+	// throwing `invalid unordered_map<K, T> key` out of a recursive visit.
+	auto It = AllDependencies.find(Index);
+	if (It == AllDependencies.end())
+		return;
+
+	auto& [IterationHitCounter, Dependencies] = It->second;
 
 	if (IterationHitCounter >= CurrentIterationHitCount)
 		return;

@@ -259,6 +259,22 @@ int main(int argc, char** argv)
 		}
 	};
 
+	// Log SEH crashes (access violations, stack overflows, ...) before the OS unwinds the
+	// process. On stripped targets generators can hit null-pointer reads that would otherwise
+	// kill us silently; the filter prints the code + faulting address so we can triage.
+	SetUnhandledExceptionFilter([](EXCEPTION_POINTERS* ep) -> LONG
+	{
+		if (ep && ep->ExceptionRecord)
+		{
+			std::cerr << "[main] UNHANDLED SEH: code=0x"
+				<< std::hex << ep->ExceptionRecord->ExceptionCode
+				<< " addr=0x" << reinterpret_cast<uintptr_t>(ep->ExceptionRecord->ExceptionAddress)
+				<< std::dec << "\n";
+			std::cerr.flush();
+		}
+		return EXCEPTION_CONTINUE_SEARCH;
+	});
+
 	runGenerator("CppGenerator",        [] { Generator::Generate<CppGenerator>(); });
 	runGenerator("MappingGenerator",    [] { Generator::Generate<MappingGenerator>(); });
 	runGenerator("IDAMappingGenerator", [] { Generator::Generate<IDAMappingGenerator>(); });

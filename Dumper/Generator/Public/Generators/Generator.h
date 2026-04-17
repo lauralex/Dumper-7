@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <iostream>
 
 #include "Unreal/ObjectArray.h"
 #include "Managers/DependencyManager.h"
@@ -58,8 +59,8 @@ private:
 
 public:
     template<GeneratorImplementation GeneratorType>
-    static void Generate() 
-    { 
+    static void Generate()
+    {
         if (DumperFolder.empty())
         {
             if (!SetupDumperFolder())
@@ -70,7 +71,13 @@ public:
                 bDumpedGObjects = true;
                 ObjectArray::DumpObjects(DumperFolder);
 
-                if (Settings::Internal::bUseFProperty)
+                // DumpObjectsWithProperties walks ChildProperties (FField) chains for every
+                // struct and emits a formatted line per property. On stripped-reflection
+                // targets accessed via hypercalls, each read is remote-dispatched, and
+                // iterating the full chain across ~117 k objects turns into tens of millions
+                // of hypercalls plus gigabytes of std::format temporaries. It's a diagnostic
+                // aid, not a dump output — skip when Settings::Debug::bSkipPropertyDump.
+                if (Settings::Internal::bUseFProperty && !Settings::Debug::bSkipPropertyDump)
                     ObjectArray::DumpObjectsWithProperties(DumperFolder);
             }
 

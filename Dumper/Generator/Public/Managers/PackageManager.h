@@ -99,7 +99,7 @@ public:
 	PackageInfoHandle(const PackageInfo& InInfo);
 
 public:
-	inline bool IsValidHandle() { return Info != nullptr; }
+	inline bool IsValidHandle() const { return Info != nullptr; }
 
 public:
 	int32 GetIndex() const;
@@ -266,7 +266,10 @@ public:
 
 	static inline std::string GetName(int32 PackageIndex)
 	{
-		 return GetInfo(PackageIndex).GetName();
+		PackageInfoHandle Info = GetInfo(PackageIndex);
+		if (!Info.IsValidHandle())
+			return "UnknownPackage_" + std::to_string(PackageIndex);
+		return Info.GetName();
 	}
 
 	static inline bool IsPackageNameUnique(const PackageInfo& Info)
@@ -274,9 +277,16 @@ public:
 		return UniquePackageNameTable[Info.Name].IsUnique();
 	}
 
+	// Returns a null handle (IsValidHandle() == false) when the index isn't tracked.
+	// Callers that previously relied on .at() throwing for missing keys have all been
+	// audited; none of them actually want the throw — they either skip gracefully or
+	// emit a placeholder name.
 	static inline PackageInfoHandle GetInfo(int32 PackageIndex)
 	{
-		return PackageInfos.at(PackageIndex);
+		auto It = PackageInfos.find(PackageIndex);
+		if (It == PackageInfos.end())
+			return {};
+		return It->second;
 	}
 
 	static inline PackageInfoHandle GetInfo(const UEObject Package)
@@ -284,7 +294,10 @@ public:
 		if (!Package)
 			return {};
 
-		return PackageInfos.at(Package.GetIndex());
+		auto It = PackageInfos.find(Package.GetIndex());
+		if (It == PackageInfos.end())
+			return {};
+		return It->second;
 	}
 
 	static inline PackageInfoIterator IterateOverPackageInfos()

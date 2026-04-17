@@ -55,24 +55,29 @@ EnumInfoHandle::EnumInfoHandle(const EnumInfo& InInfo)
 {
 }
 
+// All accessors guard against Info==nullptr. On stripped-reflection targets
+// EnumManager::GetInfo() returns a null handle for unregistered enums.
+
 uint8 EnumInfoHandle::GetUnderlyingTypeSize() const
 {
-	return Info->UnderlyingTypeSize;
+	return Info ? Info->UnderlyingTypeSize : uint8(1);
 }
 
 const StringEntry& EnumInfoHandle::GetName() const
 {
+	// Caller must first check IsValidHandle(); StringEntry has no null variant.
 	return EnumManager::GetEnumName(*Info);
 }
 
 int32 EnumInfoHandle::GetNumMembers() const
 {
-	return Info->MemberInfos.size();
+	return Info ? static_cast<int32>(Info->MemberInfos.size()) : 0;
 }
 
 CollisionInfoIterator EnumInfoHandle::GetMemberCollisionInfoIterator() const
 {
-	return CollisionInfoIterator(Info->MemberInfos);
+	static const std::vector<EnumCollisionInfo> s_Empty;
+	return CollisionInfoIterator(Info ? Info->MemberInfos : s_Empty);
 }
 
 void EnumManager::InitInternal()
@@ -136,7 +141,15 @@ void EnumManager::InitInternal()
 
 			/* Add name to override info */
 			EnumInfo& NewOrExistingInfo = EnumInfoOverrides[Obj.GetIndex()];
-			NewOrExistingInfo.Name = UniqueEnumNameTable.FindOrAdd(ObjAsEnum.GetEnumPrefixedName()).first;
+
+			// Stripped-reflection targets can leave enum names empty (zero-filled FName).
+			// Substitute a stable placeholder so HashStringTable doesn't return -1 and
+			// crash later lookups.
+			std::string EnumName = ObjAsEnum.GetEnumPrefixedName();
+			if (EnumName.empty())
+				EnumName = "UnnamedEnum_" + std::to_string(Obj.GetIndex());
+
+			NewOrExistingInfo.Name = UniqueEnumNameTable.FindOrAdd(EnumName).first;
 
 			uint64 EnumMaxValue = 0x0;
 
