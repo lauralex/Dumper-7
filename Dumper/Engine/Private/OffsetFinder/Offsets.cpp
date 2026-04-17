@@ -247,7 +247,6 @@ void Off::Init()
 	// position is easy to find reliably (FindStructSizeOffset matches Color/Guid sizes) and
 	// the rest of the UStruct members sit at fixed offsets relative to it.
 	constexpr int32 DefaultUFieldNext = 0x28;
-	constexpr int32 DefaultUStructSuper = DefaultUFieldNext + sizeof(void*);     // 0x30
 
 	// Castflags needs to stay here since the FindChildOffset() uses CastFlags
 	Off::UClass::CastFlags = OffsetFinder::FindCastFlagsOffset();
@@ -258,22 +257,31 @@ void Off::Init()
 	OverwriteIfInvalidOffset(Off::UField::Next, DefaultUFieldNext);
 	std::cerr << std::format("Off::UField::Next: 0x{:X}\n", Off::UField::Next);
 
-	Off::UStruct::SuperStruct = OffsetFinder::FindSuperOffset();
-	OverwriteIfInvalidOffset(Off::UStruct::SuperStruct, DefaultUStructSuper);
-	std::cerr << std::format("Off::UStruct::SuperStruct: 0x{:X}\n", Off::UStruct::SuperStruct);
-
+	// Discover Size FIRST so SuperStruct / Children / ChildProperties defaults can be derived
+	// from it consistently. On UE5.1+ targets with FStructBaseChain the layout is:
+	//   Next (0x28) | StructBaseChain.Array (0x30) | NumMinusOne+pad (0x38) |
+	//   SuperStruct (0x40) | Children (0x48) | ChildProperties (0x50) | Size (0x58).
+	// On pre-FStructBaseChain (UE4) it's Next (0x28) | Super (0x30) | Children (0x38) |
+	//   ChildProperties (0x40) | Size (0x48). Deriving from Size picks the right layout
+	//   automatically because Size = Children + 16 in both, and Super = Children - 8.
 	Off::UStruct::Size = OffsetFinder::FindStructSizeOffset();
 	OverwriteIfInvalidOffset(Off::UStruct::Size, 0x58); // UE5.1+ default
 	std::cerr << std::format("Off::UStruct::Size: 0x{:X}\n", Off::UStruct::Size);
 
+	// Derive Children / ChildProperties / Super defaults from discovered Size. PropertiesSize
+	// sits right after ChildProperties (8 bytes) which sits right after Children (8 bytes) which
+	// sits right after SuperStruct (8 bytes).
+	const int32 DefaultUStructChildProperties = Off::UStruct::Size - static_cast<int32>(sizeof(void*));
+	const int32 DefaultUStructChildren = DefaultUStructChildProperties - static_cast<int32>(sizeof(void*));
+	const int32 DefaultUStructSuper = DefaultUStructChildren - static_cast<int32>(sizeof(void*));
+
+	Off::UStruct::SuperStruct = OffsetFinder::FindSuperOffset();
+	OverwriteIfInvalidOffset(Off::UStruct::SuperStruct, DefaultUStructSuper);
+	std::cerr << std::format("Off::UStruct::SuperStruct: 0x{:X}\n", Off::UStruct::SuperStruct);
+
 	Off::UStruct::MinAlignment = OffsetFinder::FindMinAlignmentOffset();
 	OverwriteIfInvalidOffset(Off::UStruct::MinAlignment, Off::UStruct::Size + sizeof(int32));
 	std::cerr << std::format("Off::UStruct::MinAlignment: 0x{:X}\n", Off::UStruct::MinAlignment);
-
-	// Derive Children / ChildProperties defaults from discovered Size. PropertiesSize sits
-	// right after ChildProperties (8 bytes) which sits right after Children (8 bytes).
-	const int32 DefaultUStructChildProperties = Off::UStruct::Size - static_cast<int32>(sizeof(void*));
-	const int32 DefaultUStructChildren = DefaultUStructChildProperties - static_cast<int32>(sizeof(void*));
 
 	Off::UStruct::Children = OffsetFinder::FindChildOffset();
 	OverwriteIfInvalidOffset(Off::UStruct::Children, DefaultUStructChildren);

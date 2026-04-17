@@ -200,10 +200,37 @@ int main(int argc, char** argv)
 	const auto dumpStart = std::chrono::high_resolution_clock::now();
 
 	std::cerr << "[main] -> InitEngineCore\n";
-	Generator::InitEngineCore();
+	try
+	{
+		Generator::InitEngineCore();
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "[main] InitEngineCore threw: " << e.what() << "\n";
+		return 1;
+	}
+	catch (...)
+	{
+		std::cerr << "[main] InitEngineCore threw non-std exception\n";
+		return 1;
+	}
+
 	std::cerr << "[main] -> InitInternal\n";
-	Generator::InitInternal();
-	std::cerr << "[main] <- InitInternal\n";
+	try
+	{
+		Generator::InitInternal();
+		std::cerr << "[main] <- InitInternal\n";
+	}
+	catch (const std::exception& e)
+	{
+		std::cerr << "[main] InitInternal threw: " << e.what() << "\n";
+		// Continue into generators anyway — some backends may still be able to emit partial output
+		// based on the manager state populated so far.
+	}
+	catch (...)
+	{
+		std::cerr << "[main] InitInternal threw non-std exception\n";
+	}
 
 	if (Settings::Generator::GameName.empty() || Settings::Generator::GameVersion.empty())
 		ResolveGameNameAndVersionExternally(pid);

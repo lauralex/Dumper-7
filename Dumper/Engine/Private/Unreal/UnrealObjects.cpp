@@ -281,7 +281,11 @@ bool UEObject::IsA(UEClass Class) const
 	if (!Class)
 		return false;
 
-	for (UEClass Clss = GetClass(); Clss; Clss = Clss.GetSuper().Cast<UEClass>())
+	// Cap the super-chain walk in case GetSuper returns a cyclic/garbage pointer on a stripped
+	// or paged-out target. Deepest real UE super chain is <32; 256 is far beyond that.
+	constexpr int32 kMaxSuperDepth = 256;
+	int32 depth = 0;
+	for (UEClass Clss = GetClass(); Clss && depth < kMaxSuperDepth; Clss = Clss.GetSuper().Cast<UEClass>(), ++depth)
 	{
 		if (Clss == Class)
 			return true;
@@ -294,7 +298,12 @@ UEObject UEObject::GetOutermost() const
 {
 	UEObject Outermost = *this;
 
-	for (UEObject Outer = *this; Outer; Outer = Outer.GetOuter())
+	// Cap the Outer chain walk. On stripped / paged-out UE5 targets the Outer pointer can be
+	// garbage that forms a cycle; without the cap the whole Generator hangs in PackageManager::
+	// Init walking one bad chain forever.
+	constexpr int32 kMaxOuterDepth = 256;
+	int32 depth = 0;
+	for (UEObject Outer = *this; Outer && depth < kMaxOuterDepth; Outer = Outer.GetOuter(), ++depth)
 	{
 		Outermost = Outer;
 	}
@@ -591,7 +600,10 @@ bool UEStruct::HasType(UEStruct Type) const
 	if (Type == nullptr)
 		return false;
 
-	for (UEStruct S = *this; S; S = S.GetSuper())
+	// Cap the super chain — a cyclic GetSuper on a stripped/paged-out target would otherwise spin.
+	constexpr int32 kMaxSuperDepth = 256;
+	int32 depth = 0;
+	for (UEStruct S = *this; S && depth < kMaxSuperDepth; S = S.GetSuper(), ++depth)
 	{
 		if (S == Type)
 			return true;
@@ -600,13 +612,21 @@ bool UEStruct::HasType(UEStruct Type) const
 	return false;
 }
 
+// External-mode guard: the FField/UField linked lists are walked by dereferencing the Next
+// pointer each iteration. On stripped or paged-out UE5 targets the Next pointer can be
+// garbage that happens to form a cycle (A -> B -> A) — without a depth cap the walker spins
+// forever and the whole generator stage hangs. Real UE structs have at most a few hundred
+// fields; the cap is several orders of magnitude above that but low enough to fail fast.
+static constexpr int32 kMaxFieldChainDepth = 4096;
+
 std::vector<UEProperty> UEStruct::GetProperties() const
 {
 	std::vector<UEProperty> Properties;
 
 	if (Settings::Internal::bUseFProperty)
 	{
-		for (UEFField Field = GetChildProperties(); Field; Field = Field.GetNext())
+		int32 depth = 0;
+		for (UEFField Field = GetChildProperties(); Field && depth < kMaxFieldChainDepth; Field = Field.GetNext(), ++depth)
 		{
 			if (Field.IsA(EClassCastFlags::Property))
 				Properties.push_back(Field.Cast<UEProperty>());
@@ -614,7 +634,8 @@ std::vector<UEProperty> UEStruct::GetProperties() const
 
 		return Properties;
 	}
-	for (UEField Field = GetChild(); Field; Field = Field.GetNext())
+	int32 depth = 0;
+	for (UEField Field = GetChild(); Field && depth < kMaxFieldChainDepth; Field = Field.GetNext(), ++depth)
 	{
 		if (Field.IsA(EClassCastFlags::Property))
 			Properties.push_back(Field.Cast<UEProperty>());
@@ -627,7 +648,8 @@ std::vector<UEFunction> UEStruct::GetFunctions() const
 {
 	std::vector<UEFunction> Functions;
 
-	for (UEField Field = GetChild(); Field; Field = Field.GetNext())
+	int32 depth = 0;
+	for (UEField Field = GetChild(); Field && depth < kMaxFieldChainDepth; Field = Field.GetNext(), ++depth)
 	{
 		if (Field.IsA(EClassCastFlags::Function))
 			Functions.push_back(Field.Cast<UEFunction>());
@@ -643,7 +665,8 @@ UEProperty UEStruct::FindMember(const std::string& MemberName, EClassCastFlags T
 
 	if (Settings::Internal::bUseFProperty)
 	{
-		for (UEFField Field = GetChildProperties(); Field; Field = Field.GetNext())
+		int32 depth = 0;
+		for (UEFField Field = GetChildProperties(); Field && depth < kMaxFieldChainDepth; Field = Field.GetNext(), ++depth)
 		{
 			if (Field.IsA(TypeFlags) && Field.GetName() == MemberName)
 			{
@@ -652,7 +675,8 @@ UEProperty UEStruct::FindMember(const std::string& MemberName, EClassCastFlags T
 		}
 	}
 
-	for (UEField Field = GetChild(); Field; Field = Field.GetNext())
+	int32 depth = 0;
+	for (UEField Field = GetChild(); Field && depth < kMaxFieldChainDepth; Field = Field.GetNext(), ++depth)
 	{
 		if (Field.IsA(TypeFlags) && Field.GetName() == MemberName)
 		{
@@ -670,7 +694,8 @@ bool UEStruct::HasMembers() const
 
 	if (Settings::Internal::bUseFProperty)
 	{
-		for (UEFField Field = GetChildProperties(); Field; Field = Field.GetNext())
+		int32 depth = 0;
+		for (UEFField Field = GetChildProperties(); Field && depth < kMaxFieldChainDepth; Field = Field.GetNext(), ++depth)
 		{
 			if (Field.IsA(EClassCastFlags::Property))
 				return true;
@@ -678,7 +703,8 @@ bool UEStruct::HasMembers() const
 	}
 	else
 	{
-		for (UEField F = GetChild(); F; F = F.GetNext())
+		int32 depth = 0;
+		for (UEField F = GetChild(); F && depth < kMaxFieldChainDepth; F = F.GetNext(), ++depth)
 		{
 			if (F.IsA(EClassCastFlags::Property))
 				return true;
