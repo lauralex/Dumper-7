@@ -26,6 +26,22 @@ namespace OffsetFinder
 				continue;
 			}
 
+			// Pointer-valued probes must not pass a null expected value: struct padding reads
+			// as zero at many offsets so a null expected-value false-matches everywhere. This
+			// is a stripped-reflection hazard (callers do `FindObjectFast("X").GetAddress()`
+			// which returns nullptr when the class isn't registered) and caused false
+			// discoveries like UStruct::Children=0x28 on UE5 targets. Non-pointer probes with
+			// genuine-zero expected values (e.g. ArrayDim==1) are still fine because their
+			// offset ranges are controlled by MinOffset.
+			if constexpr (std::is_pointer_v<T>)
+			{
+				if (ObjectValuePair[i].second == nullptr)
+				{
+					std::cerr << "Dumper-7 ERROR: FindOffset is skipping ObjectValuePair[" << i << "] because .second is nullptr." << std::endl;
+					continue;
+				}
+			}
+
 			for (int j = HighestFoundOffset; j < MaxOffset; j += Alignement)
 			{
 				const T TypedValueAtOffset = RDeref<T>(static_cast<uint8_t*>(ObjectValuePair[i].first) + j);

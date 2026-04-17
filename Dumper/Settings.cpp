@@ -9,30 +9,58 @@
 
 void Settings::InitWeakObjectPtrSettings()
 {
-	const UEStruct LoadAsset = ObjectArray::FindObjectFast<UEFunction>("LoadAsset", EClassCastFlags::Function);
-
-	if (!LoadAsset)
-	{
-		std::cerr << "\nDumper-7: 'LoadAsset' wasn't found, could not determine value for 'bIsWeakObjectPtrWithoutTag'!\n" << std::endl;
-		return;
-	}
-
-	const UEProperty Asset = LoadAsset.FindMember("Asset", EClassCastFlags::SoftObjectProperty);
-	if (!Asset)
-	{
-		std::cerr << "\nDumper-7: 'Asset' wasn't found, could not determine value for 'bIsWeakObjectPtrWithoutTag'!\n" << std::endl;
-		return;
-	}
-
-	const UEStruct SoftObjectPath = ObjectArray::FindStructFast("SoftObjectPath");
-
 	constexpr int32 SizeOfFFWeakObjectPtr = 0x08;
 	constexpr int32 OldUnrealAssetPtrSize = 0x10;
+
+	const UEStruct SoftObjectPath = ObjectArray::FindStructFast("SoftObjectPath");
 	const int32 SizeOfSoftObjectPath = SoftObjectPath ? SoftObjectPath.GetStructSize() : OldUnrealAssetPtrSize;
 
-	Settings::Internal::bIsWeakObjectPtrWithoutTag = Asset.GetSize() <= (SizeOfSoftObjectPath + SizeOfFFWeakObjectPtr);
+	// Primary probe: LoadAsset.Asset (a SoftObjectProperty). Its size tells us whether the
+	// TWeakObjectPtr tail-tag is present — if the property size fits inside
+	// SoftObjectPath + FWeakObjectPtr alone, the tag is gone (UE5.0+).
+	const UEStruct LoadAsset = ObjectArray::FindObjectFast<UEFunction>("LoadAsset", EClassCastFlags::Function);
+	if (LoadAsset)
+	{
+		if (const UEProperty Asset = LoadAsset.FindMember("Asset", EClassCastFlags::SoftObjectProperty))
+		{
+			Settings::Internal::bIsWeakObjectPtrWithoutTag = Asset.GetSize() <= (SizeOfSoftObjectPath + SizeOfFFWeakObjectPtr);
+			return;
+		}
+	}
 
-	//std::cerr << std::format("\nDumper-7: bIsWeakObjectPtrWithoutTag = {}\n", Settings::Internal::bIsWeakObjectPtrWithoutTag) << std::endl;
+	// Fallback: scan every UStruct for any SoftObjectProperty and use the first one's size.
+	// LoadAsset is sometimes stripped from shipping-build reflection; any SoftObjectProperty
+	// of the right type will do, because the tail-tag presence is a per-build compile-time
+	// choice, not a per-property one.
+	for (const UEObject Obj : ObjectArray())
+	{
+		if (!Obj.IsA(EClassCastFlags::Struct))
+			continue;
+
+		for (const UEProperty P : Obj.Cast<UEStruct>().GetProperties())
+		{
+			if (!P.IsA(EClassCastFlags::SoftObjectProperty))
+				continue;
+			Settings::Internal::bIsWeakObjectPtrWithoutTag = P.GetSize() <= (SizeOfSoftObjectPath + SizeOfFFWeakObjectPtr);
+			std::cerr << std::format(
+				"\nDumper-7: 'LoadAsset' not found; inferred bIsWeakObjectPtrWithoutTag = {} from {}::{} (size 0x{:X})\n\n",
+				Settings::Internal::bIsWeakObjectPtrWithoutTag,
+				Obj.GetName(), P.GetName(), P.GetSize());
+			return;
+		}
+	}
+
+	// Last-resort default: for any target where the size of FVector is 0x18 (three doubles,
+	// UE5+ LWC) the WeakObjectPtr tag is nearly always absent.
+	const UEStruct VectorStruct = ObjectArray::FindStructFast("Vector");
+	if (VectorStruct && VectorStruct.GetStructSize() >= 0x18)
+	{
+		Settings::Internal::bIsWeakObjectPtrWithoutTag = true;
+		std::cerr << "\nDumper-7: 'LoadAsset' not found; inferred bIsWeakObjectPtrWithoutTag = true from UE5-sized FVector\n\n" << std::endl;
+		return;
+	}
+
+	std::cerr << "\nDumper-7: 'LoadAsset' wasn't found and no SoftObjectProperty fallback worked; bIsWeakObjectPtrWithoutTag stays at default\n" << std::endl;
 }
 
 void Settings::InitLargeWorldCoordinateSettings()
@@ -45,18 +73,26 @@ void Settings::InitLargeWorldCoordinateSettings()
 		return;
 	}
 
-	const UEProperty XProperty = FVectorStruct.FindMember("X");
+	// Try uppercase X first, then lowercase x (some UE5 builds use lowercase).
+	UEProperty XProperty = FVectorStruct.FindMember("X");
+	if (!XProperty)
+		XProperty = FVectorStruct.FindMember("x");
 
-	if (!XProperty) [[unlikely]]
+	if (XProperty)
 	{
-		std::cerr << "\nSomething went horribly wrong, FVector::X wasn't even found!\n\n" << std::endl;
+		/* Check the underlaying type of FVector::X. If it's double we're on UE5.0, or higher, and using large world coordinates. */
+		Settings::Internal::bUseLargeWorldCoordinates = XProperty.IsA(EClassCastFlags::DoubleProperty);
 		return;
 	}
 
-		/* Check the underlaying type of FVector::X. If it's double we're on UE5.0, or higher, and using large world coordinates. */
-	Settings::Internal::bUseLargeWorldCoordinates = XProperty.IsA(EClassCastFlags::DoubleProperty);
+	// Struct-size fallback: UE5 LWC-FVector is 0x18 (3 doubles), UE4 FVector is 0x0C (3 floats).
+	// This works even when the FField walk is broken by stripped/paged-out ChildProperties.
+	const int32 VectorSize = FVectorStruct.GetStructSize();
+	Settings::Internal::bUseLargeWorldCoordinates = VectorSize >= 0x18;
 
-	//std::cerr << std::format("\nDumper-7: bUseLargeWorldCoordinates = {}\n", Settings::Internal::bUseLargeWorldCoordinates) << std::endl;
+	std::cerr << std::format(
+		"\nDumper-7: 'FVector::X' not found; inferred bUseLargeWorldCoordinates = {} from FVector size 0x{:X}\n\n",
+		Settings::Internal::bUseLargeWorldCoordinates, VectorSize);
 }
 
 void Settings::InitObjectPtrPropertySettings()

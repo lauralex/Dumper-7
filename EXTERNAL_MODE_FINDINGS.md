@@ -1,8 +1,91 @@
 # External Mode (hv-nebula) — Findings and Plan
 
 Branch: `external-mode-hv-nebula`
-HEAD: `3fcbdf3` (2026-04-17)
+HEAD: uncommitted WIP (2026-04-17)
 Test target: `DoubleClutch-Win64-Shipping.exe` (UE5.1.1.0, reflection-stripped)
+
+## 2026-04-17 diagnosis: target is multiply-hardened
+
+Three separate problems compound on DoubleClutch:
+
+**1. Target FField heap pages are not physically resident.** `Actor+0x50` reads a
+non-zero pointer (e.g. `0x2072BCF0900`), proving Actor's own page is resident AND our
+`ChildProperties` offset is correct. But reading the FField AT that pointer returns 48
+bytes of zeros via the hypercall, and `hv::get_physical_address(cr3, 0x2072BCF0900)`
+returns **0** — no physical mapping for that VA. `VirtualQueryEx` via an external handle
+confirms the VA is `MEM_COMMIT`/`PAGE_READWRITE` with a valid `AllocationBase`, so the
+target has the page committed in its VAD tree but the PTE is marked "not present". The
+hypervisor's physical-memory read can't fault in paged-out pages, so every
+ChildProperties → FField walk dead-ends immediately and every property-offset finder
+that relies on that walk returns -1. Same pattern for Color, Vector, Guid, and every
+other struct we probe.
+
+**2. `ReadProcessMemory` is blocked at the kernel level.** Opening the process with
+`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ` succeeds (handle 0xb4 returned),
+and `VirtualQueryEx` on that handle works. But `ReadProcessMemory` at any address
+returns 0 bytes with `GetLastError == ERROR_ACCESS_DENIED (5)` — including on pages the
+hypercall DOES read (e.g. Actor's own UStruct page at allocBase `0x20708EA00000`, where
+`phys=0x14B7521B0` and the hypercall returns real layout bytes). This is the
+anti-cheat (EAC presumably) hooking `NtReadVirtualMemory` in the kernel. So the "fall
+back to RPM when hypercall returns zero" plan is DOA — RPM isn't available.
+
+**3. `hv::query_process_cr3` is non-deterministic.** Same hypercall, same PID,
+different invocations return different CR3 values: the dumper got `0x3519A5000`,
+hv-mcp got `0x342CA5000`, on the same PID 18240 at nearly the same time. Only one of
+them is "good enough" to read Actor's UStruct. `scan_process_dtb` returns 0 for this
+target. The dumper now validates candidate CR3s by reading the main module's 'MZ'
+signature; it lands on the right one, but the underlying hypervisor behavior is still
+wrong and we don't control it from here.
+
+### What this means for "everything should be working"
+
+Pure-hypervisor dumping cannot read this target's FField heap because the pages aren't
+resident and the anti-cheat blocks the RPM fallback. No amount of client-side
+hardening will read data that doesn't have a physical backing.
+
+Options, in order of invasiveness:
+
+1. **Accept the limitation.** Document that stripped-reflection targets with
+   EAC-class anti-cheat aren't usable in pure-hypervisor mode. Users dump warmer
+   targets (other UE5 games where reflection pages are resident).
+
+2. **Add a hypercall to hv-nebula** (separate codebase) that forces pages resident by
+   issuing a kernel-side touch in the target's context — basically doing
+   `MmProbeAndLockPages` or `MmMapLockedPagesSpecifyCache` via the hypervisor's access
+   to the target's PEB/VAD. Invisible to anti-cheat since no user-mode syscall is
+   involved. Requires a separate patch.
+
+3. **Signature-based offset discovery.** Task #10 in the plan: pattern-scan the main
+   module's disk-backed `.text` for known UE engine function prologues (`UStruct::Link`,
+   `FProperty::InitializeValue`, etc.) and extract offsets from their `mov [rcx+OFF]`
+   displacements. This side-steps the heap entirely — all data comes from the .text
+   cache, which is disk-backed and always readable. Doesn't require any changes to
+   hv-nebula. Scope is large (~15-20 offsets), but it's the only fully-external
+   approach that works on hardened targets.
+
+### Fixes landed in this WIP session (uncommitted)
+
+- `FixupHardcodedOffsets` now scores both FField layouts via FName resolution, with
+  legacy `+0x18` pointer check as primary and scoring as fallback when the page IS
+  resident. Documents that both scores == 0 means pages aren't faulted in.
+- `FindOffset<T>` now rejects pointer-valued probes with nullptr `.second` (fixed a
+  false-discovery where `Off::UStruct::Children=0x28` on UE5 targets with stripped
+  `PlayerController` reflection).
+- `InitializeFUObjectItem` uses score-based probing over 256 slots instead of
+  sequential validation, robust against per-page paging of the chunk.
+- `InitLargeWorldCoordinateSettings` falls back to Vector struct size when X property
+  isn't findable (UE5 is ≥0x18, UE4 is 0x0C).
+- `InitWeakObjectPtrSettings` scans any SoftObjectProperty as fallback if LoadAsset
+  UFunction is missing, then falls back to Vector-size inference.
+- `FindFFieldNameOffset` bails early if the GuidChild / VectorChild page is zero-filled
+  (prevents downstream NameArray crash from out-of-range ComparisonIndex).
+- `FindNameOffsetForSomeClass` guards against division-by-zero when the iterator yields
+  no objects (also prevents crash on paged-out targets).
+- `RemoteMemory::Init` validates candidate CR3s by reading `MZ` at main module base;
+  falls back to `scan_process_dtb` CR3 if the primary fails validation.
+- `Off::Property::{ArrayDim,ElementSize,PropertyFlags,Offset_Internal}` now get derived
+  defaults from `FField::Flags + 4` instead of staying at -1 and cascading into
+  StructProperty::Struct = -1 etc.
 
 ---
 

@@ -51,21 +51,25 @@ namespace RemoteMemory
 		}
 	}
 
+	// Validate a candidate CR3 by probing the main module base: needs to map to a physical
+	// page AND the first two bytes must be 'MZ'. Anti-cheat / EPROCESS-spoofing games sometimes
+	// return stale or decoy CR3s from query_process_cr3; scan_process_dtb's linear DTB scan is
+	// a better fallback there even when the primary call returns non-zero.
+	static bool ValidateCr3(uint64_t candidate, uintptr_t moduleBase)
+	{
+		if (candidate == 0 || moduleBase == 0)
+			return false;
+		if (hv::get_physical_address(candidate, reinterpret_cast<void*>(moduleBase)) == 0)
+			return false;
+		uint16_t probe = 0;
+		if (hv::read_virt_mem(candidate, &probe, reinterpret_cast<void*>(moduleBase), sizeof(probe)) != sizeof(probe))
+			return false;
+		return probe == 0x5A4D;
+	}
+
 	bool Init(DWORD pid)
 	{
 		g_pid = pid;
-
-		hv::g_cr3 = hv::query_process_cr3(pid);
-		if (hv::g_cr3 == 0)
-		{
-			std::cerr << "[RemoteMemory] query_process_cr3 returned 0, falling back to scan_process_dtb...\n";
-			hv::g_cr3 = hv::scan_process_dtb(pid);
-		}
-		if (hv::g_cr3 == 0)
-		{
-			std::cerr << "[RemoteMemory] Failed to resolve CR3 for PID " << pid << "\n";
-			return false;
-		}
 
 		g_mainModuleBase = hv::get_section_base_process(pid);
 		if (g_mainModuleBase == 0)
@@ -74,11 +78,26 @@ namespace RemoteMemory
 			return false;
 		}
 
-		uint16_t probe = 0;
-		if (hv::read_virt_mem(&probe, reinterpret_cast<void*>(g_mainModuleBase), sizeof(probe)) != sizeof(probe) || probe != 0x5A4D)
+		// Query_process_cr3 walks ActiveProcessLinks; returns the first EPROCESS match. On
+		// anti-cheat-protected targets this sometimes lands on a stale/decoy entry. Ask both
+		// primary and fallback; pick whichever validates against the main module's 'MZ'.
+		const uint64_t cr3a = hv::query_process_cr3(pid);
+		const uint64_t cr3b = hv::scan_process_dtb(pid);
+		std::cerr << std::format("[RemoteMemory] query_process_cr3=0x{:X}, scan_process_dtb=0x{:X}\n", cr3a, cr3b);
+
+		if (ValidateCr3(cr3a, g_mainModuleBase))
 		{
-			std::cerr << "[RemoteMemory] Main module base 0x" << std::hex << g_mainModuleBase
-			          << " does not start with 'MZ' (got 0x" << probe << "). CR3 may be wrong.\n" << std::dec;
+			hv::g_cr3 = cr3a;
+		}
+		else if (ValidateCr3(cr3b, g_mainModuleBase))
+		{
+			std::cerr << "[RemoteMemory] query_process_cr3 didn't validate; using scan_process_dtb CR3\n";
+			hv::g_cr3 = cr3b;
+		}
+		else
+		{
+			std::cerr << "[RemoteMemory] Neither CR3 candidate passes the 'MZ' validation at 0x"
+			          << std::hex << g_mainModuleBase << std::dec << "\n";
 			return false;
 		}
 

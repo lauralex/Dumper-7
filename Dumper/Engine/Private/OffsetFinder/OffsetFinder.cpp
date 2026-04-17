@@ -186,6 +186,13 @@ int32_t FindNameOffsetForSomeClass(std::function<bool(int32_t Value)> IsPotentia
 		}
 	}
 
+	if (NumObjectsConsidered == 0)
+	{
+		std::cerr << "[FindNameOffsetForSomeClass] No objects were considered (probe ran over an empty iterator). "
+		             "Usually this means the Field walk is broken by paged-out target memory; returning OffsetNotFound.\n";
+		return -1;
+	}
+
 	int32 FirstValidOffset = -1;
 	for (const ValueInfo& Info : PossibleOffsets)
 	{
@@ -269,54 +276,133 @@ void OffsetFinder::FixupHardcodedOffsets()
 		Off::FFieldClass::SuperClass += 0x08;
 	}
 
-	if (Settings::Internal::bUseFProperty)
+	if (!Settings::Internal::bUseFProperty)
+		return;
+
+	/*
+	 * Detect UE5.1.1+ FFieldVariant shrinkage (removal of bOwnerIsField bool + 7B padding).
+	 *
+	 * Primary: the legacy +0x18 pointer-validity check across Actor/ActorComponent/Pawn.
+	 * Backup:  score both candidate layouts by walking ChildProperties and counting how many
+	 *          FField nodes expose a real FName. This only works if the heap pages are
+	 *          resident; on hypercall-only external mode with paged-out target heaps both
+	 *          scores come back 0.
+	 *
+	 * When BOTH are ambiguous (legacy check all-zero AND both scores zero) we fall back to
+	 * keeping the pre-5.1.1 layout. Per-game overrides via Settings are still the escape hatch.
+	 */
+	std::vector<UEStruct> testStructs;
+	for (const char* n : { "Actor", "ActorComponent", "Pawn", "Object",
+	                       "Color", "Vector", "Vector2D", "Vector4", "Guid", "TwoVectors", "Transform" })
 	{
-		/*
-		* On versions below 5.1.1: class FFieldVariant { void*, bool } -> extends to { void*, bool, uint8[0x7] }
-		* ON versions since 5.1.1: class FFieldVariant { void* }
-		*
-		* Check:
-		* if FFieldVariant contains a bool, the memory at the bools offset will not be a valid pointer
-		* if FFieldVariant doesn't contain a bool, the memory at the bools offset will be the next member of FField, the Next ptr [valid]
-		*/
+		const UEStruct s = ObjectArray::FindStructFast(n);
+		if (s)
+			testStructs.push_back(s);
+	}
 
-		const int32 OffsetToCheck = Off::FField::Owner + 0x8;
-		const void* ActorChildPropsField     = ObjectArray::FindClassFast("Actor").GetChildProperties().GetAddress();
-		const void* ActorCompChildPropsField = ObjectArray::FindClassFast("ActorComponent").GetChildProperties().GetAddress();
-		const void* PawnChildPropsField      = ObjectArray::FindClassFast("Pawn").GetChildProperties().GetAddress();
-
-		void* PossibleNextPtrOrBool0 = RDeref<void*>((uint8*)ActorChildPropsField + OffsetToCheck);
-		void* PossibleNextPtrOrBool1 = RDeref<void*>((uint8*)ActorCompChildPropsField + OffsetToCheck);
-		void* PossibleNextPtrOrBool2 = RDeref<void*>((uint8*)PawnChildPropsField + OffsetToCheck);
-
-		std::cerr << std::format("[FixupHardcodedOffsets] Actor.ChildProps={}  (+{}={}) -> next/bool=0x{:X}\n",
-			ActorChildPropsField, OffsetToCheck, (const void*)((const uint8*)ActorChildPropsField + OffsetToCheck),
-			reinterpret_cast<uintptr_t>(PossibleNextPtrOrBool0));
-		std::cerr << std::format("[FixupHardcodedOffsets] ActorComp.ChildProps={}  -> next/bool=0x{:X}\n",
-			ActorCompChildPropsField, reinterpret_cast<uintptr_t>(PossibleNextPtrOrBool1));
-		std::cerr << std::format("[FixupHardcodedOffsets] Pawn.ChildProps={}  -> next/bool=0x{:X}\n",
-			PawnChildPropsField, reinterpret_cast<uintptr_t>(PossibleNextPtrOrBool2));
-
-		auto IsValidPtr = [](void* a) -> bool
+	auto isLikelyRealName = [](const std::string& s) -> bool
+	{
+		if (s.empty() || s == "None")
+			return false;
+		const unsigned char c0 = static_cast<unsigned char>(s[0]);
+		if (c0 < 0x20 || c0 > 0x7E)
+			return false;
+		if (!(std::isalpha(c0) || c0 == '_'))
+			return false;
+		for (unsigned char c : s)
 		{
-			return !Platform::IsBadReadPtr(a) && (uintptr_t(a) & 0x1) == 0; // realistically, there wont be any pointers to unaligned memory
-		};
-
-		const bool v0 = IsValidPtr(PossibleNextPtrOrBool0);
-		const bool v1 = IsValidPtr(PossibleNextPtrOrBool1);
-		const bool v2 = IsValidPtr(PossibleNextPtrOrBool2);
-		std::cerr << std::format("[FixupHardcodedOffsets] IsValidPtr: {} {} {}\n", v0, v1, v2);
-
-		if (v0 && v1 && v2)
-		{
-			std::cerr << "Applaying fix to hardcoded offsets \n" << std::endl;
-
-			Settings::Internal::bUseMaskForFieldOwner = true;
-
-			Off::FField::Next -= 0x08;
-			Off::FField::Name -= 0x08;
-			Off::FField::Flags -= 0x08;
+			if (c < 0x20 || c > 0x7E)
+				return false;
 		}
+		return true;
+	};
+
+	auto scoreLayout = [&](int nextOff, int nameOff) -> int
+	{
+		int score = 0;
+		for (UEStruct s : testStructs)
+		{
+			uintptr_t head = RDeref<uintptr_t>(reinterpret_cast<const uint8*>(s.GetAddress()) + Off::UStruct::ChildProperties);
+			if (head == 0 || Platform::IsBadReadPtr(head))
+				continue;
+
+			for (int depth = 0; depth < 16; ++depth)
+			{
+				const FName asFName(reinterpret_cast<const uint8*>(head) + nameOff);
+				const std::string resolved = asFName.ToString();
+				if (isLikelyRealName(resolved))
+					++score;
+
+				const uintptr_t next = RDeref<uintptr_t>(reinterpret_cast<uint8*>(head) + nextOff);
+				if (next == 0 || next == head || Platform::IsBadReadPtr(next))
+					break;
+				head = next;
+			}
+		}
+		return score;
+	};
+
+	// Legacy pointer-validity probe (picks up 5.1.1+ when at least one of the three structs
+	// has a Next pointer at the bool's old offset).
+	const int32 OffsetToCheck = Off::FField::Owner + 0x8;
+	const void* ActorChildPropsField     = ObjectArray::FindClassFast("Actor").GetChildProperties().GetAddress();
+	const void* ActorCompChildPropsField = ObjectArray::FindClassFast("ActorComponent").GetChildProperties().GetAddress();
+	const void* PawnChildPropsField      = ObjectArray::FindClassFast("Pawn").GetChildProperties().GetAddress();
+
+	auto LegacyProbe = [&](const void* Head) -> bool
+	{
+		if (!Head || Platform::IsBadReadPtr(Head))
+			return false;
+		const void* val = RDeref<void*>(reinterpret_cast<const uint8*>(Head) + OffsetToCheck);
+		return !Platform::IsBadReadPtr(val) && (reinterpret_cast<uintptr_t>(val) & 0x1) == 0;
+	};
+	const bool legacyHit = LegacyProbe(ActorChildPropsField) && LegacyProbe(ActorCompChildPropsField) && LegacyProbe(PawnChildPropsField);
+
+	// Score-based probe (picks up 5.1.1+ when heap pages are resident enough to walk).
+	const int scoreOld = scoreLayout(0x20, 0x28);
+	const int scoreNew = scoreLayout(0x18, 0x20);
+
+	std::cerr << std::format(
+		"[FixupHardcodedOffsets] legacy-probe-hit={}, scores: old(Next=0x20,Name=0x28)={}, new(Next=0x18,Name=0x20)={}\n",
+		legacyHit, scoreOld, scoreNew);
+
+	// Diagnostic: dump UStruct bytes AND the first-FField bytes so a future debugging run can
+	// tell whether the ChildProperties offset points into readable memory and what the first
+	// FField slot actually holds. On stripped/protected targets these often come back as
+	// zeros because the target's FField heap pages aren't physically resident — hv-nebula
+	// reads physical memory via page tables and returns 0 bytes for a "not present" PTE.
+	for (const char* n : { "Actor", "Color", "TwoVectors" })
+	{
+		UEStruct s = ObjectArray::FindStructFast(n);
+		if (!s)
+			continue;
+
+		const uintptr_t cp = RDeref<uintptr_t>(reinterpret_cast<const uint8*>(s.GetAddress()) + Off::UStruct::ChildProperties);
+		if (cp == 0)
+			continue;
+
+		uint8 buf[48]{};
+		RemoteMemory::ReadBuffer(cp, buf, sizeof(buf), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		const uint64_t phys = hv::get_physical_address(hv::g_cr3, reinterpret_cast<void*>(cp));
+		std::cerr << std::format("[FixupHardcodedOffsets] {}.first-FField @ 0x{:X} phys=0x{:X} bytes:", n, cp, phys);
+		for (int i = 0; i < 48; ++i)
+			std::cerr << std::format(" {:02X}", buf[i]);
+		std::cerr << "\n";
+	}
+
+	const bool applyNewLayout = legacyHit || (scoreNew > scoreOld && scoreNew > 0);
+
+	if (applyNewLayout)
+	{
+		std::cerr << "[FixupHardcodedOffsets] Applying UE5.1.1+ FFieldVariant shrinkage fix\n";
+		Settings::Internal::bUseMaskForFieldOwner = true;
+		Off::FField::Next -= 0x08;
+		Off::FField::Name -= 0x08;
+		Off::FField::Flags -= 0x08;
+	}
+	else
+	{
+		std::cerr << "[FixupHardcodedOffsets] Keeping pre-5.1.1 FField layout\n";
 	}
 }
 
@@ -490,6 +576,24 @@ int32_t OffsetFinder::FindFFieldNameOffset()
 	UEFField VectorChild = VectorStruct.GetChildProperties();
 	if (!GuidChild || !VectorChild)
 		return OffsetNotFound;
+
+	// Early bail if the ChildProperties pages aren't physically resident. Walking garbage
+	// FNames calls into NameArray with out-of-range ComparisonIndex values and crashes the
+	// dumper; a zero-byte first 16B indicates the heap page isn't faulted in and no
+	// discovery is possible.
+	auto pageLooksZero = [](const void* addr) -> bool
+	{
+		uint8 b[16]{};
+		RemoteMemory::ReadBuffer(reinterpret_cast<uintptr_t>(addr), b, sizeof(b), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		for (uint8 v : b)
+			if (v != 0) return false;
+		return true;
+	};
+	if (pageLooksZero(GuidChild.GetAddress()) || pageLooksZero(VectorChild.GetAddress()))
+	{
+		std::cerr << "[FindFFieldNameOffset] ChildProperties pages are zero-filled (not resident); skipping discovery\n";
+		return OffsetNotFound;
+	}
 
 	std::string GuidChildName = GuidChild.GetName();
 	std::string VectorChildName = VectorChild.GetName();

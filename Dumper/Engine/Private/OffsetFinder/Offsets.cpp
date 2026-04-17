@@ -343,24 +343,46 @@ void Off::Init()
 	std::cerr << std::format("Off::UEnum::Names: 0x{:X}\n", Off::UEnum::Names) << std::endl;
 
 	Off::UFunction::FunctionFlags = OffsetFinder::FindFunctionFlagsOffset();
+	OverwriteIfInvalidOffset(Off::UFunction::FunctionFlags, Off::UStruct::Size + 0x10); // UE5.1+ default (right after UStruct)
 	std::cerr << std::format("Off::UFunction::FunctionFlags: 0x{:X}\n", Off::UFunction::FunctionFlags);
 
 	Off::UFunction::ExecFunction = OffsetFinder::FindFunctionNativeFuncOffset();
 	std::cerr << std::format("Off::UFunction::ExecFunction: 0x{:X}\n", Off::UFunction::ExecFunction) << std::endl;
 
+	// Derive FProperty sub-offset defaults from the FField size. For UE5.1.1+ (FFieldVariant = void*)
+	// FField ends at 0x30; for pre-5.1.1 (FFieldVariant = { void*, bool }) it ends at 0x38.
+	// FProperty members start there: ArrayDim:int32, ElementSize:int32, PropertyFlags:uint64,
+	// RepIndex:uint16, BlueprintReplicationCondition:uint8 (+pad), RepNotifyFunc:FName, Offset_Internal:int32.
+	const int32 FFieldSize = Off::FField::Flags + static_cast<int32>(sizeof(int32));
+	const int32 DefaultArrayDim = FFieldSize;                                        // +0
+	const int32 DefaultElementSize = DefaultArrayDim + static_cast<int32>(sizeof(int32));       // +4
+	const int32 DefaultPropertyFlags = DefaultElementSize + static_cast<int32>(sizeof(int32));  // +8
+	// After PropertyFlags (uint64) comes RepIndex(uint16) + BlueprintReplicationCondition(uint8)
+	// + padding (5B), then RepNotifyFunc (FName, FNameSize bytes), then Offset_Internal (int32).
+	const int32 DefaultOffsetInternal = DefaultPropertyFlags + static_cast<int32>(sizeof(uint64))
+		+ 0x8 /* RepIndex+Cond+pad */ + Off::InSDK::Name::FNameSize;
+
 	Off::Property::ElementSize = OffsetFinder::FindElementSizeOffset();
+	OverwriteIfInvalidOffset(Off::Property::ElementSize, DefaultElementSize);
 	std::cerr << std::format("Off::Property::ElementSize: 0x{:X}\n", Off::Property::ElementSize);
 
 	Off::Property::ArrayDim = OffsetFinder::FindArrayDimOffset();
+	OverwriteIfInvalidOffset(Off::Property::ArrayDim, DefaultArrayDim);
 	std::cerr << std::format("Off::Property::ArrayDim: 0x{:X}\n", Off::Property::ArrayDim);
 
 	Off::Property::Offset_Internal = OffsetFinder::FindOffsetInternalOffset();
+	OverwriteIfInvalidOffset(Off::Property::Offset_Internal, DefaultOffsetInternal);
 	std::cerr << std::format("Off::Property::Offset_Internal: 0x{:X}\n", Off::Property::Offset_Internal);
 
 	Off::Property::PropertyFlags = OffsetFinder::FindPropertyFlagsOffset();
+	OverwriteIfInvalidOffset(Off::Property::PropertyFlags, DefaultPropertyFlags);
 	std::cerr << std::format("Off::Property::PropertyFlags: 0x{:X}\n", Off::Property::PropertyFlags);
 
 	Off::BoolProperty::Base = OffsetFinder::FindBoolPropertyBaseOffset();
+	// BoolProperty::Base sits right after Offset_Internal + a PropertyLink/PropertyLinkNext chain
+	// (6 pointers = 0x30 bytes) on most UE5.1 builds. Use that as a last-resort default.
+	const int32 DefaultBoolPropertyBase = Off::Property::Offset_Internal + static_cast<int32>(sizeof(int32)) + 0x30;
+	OverwriteIfInvalidOffset(Off::BoolProperty::Base, DefaultBoolPropertyBase);
 	std::cerr << std::format("UBoolProperty::Base: 0x{:X}\n", Off::BoolProperty::Base) << std::endl;
 
 	Off::EnumProperty::Base = OffsetFinder::FindEnumPropertyBaseOffset();

@@ -214,37 +214,73 @@ bool IsAddressValidGObjects(const uintptr_t Address, const FChunkedFixedUObjectA
 
 void ObjectArray::InitializeFUObjectItem(uint8_t* FirstItemPtr)
 {
-	for (int i = 0x0; i < 0x20; i += 4)
+	// Discover the InitialOffset (position of the UObject pointer within an FUObjectItem slot)
+	// and the SizeOfFUObjectItem stride via score-based probing. Sequential validation that
+	// bails on the first bad read breaks on external-mode targets where individual heap pages
+	// can be paged out — we pick the (offset, stride) combo that maximises the number of slots
+	// whose pointer field points into a plausible user-space range.
+	//
+	// UE4.21+: FUObjectItem = { UObject* Object, int32 Flags, int32 ClusterRootIndex, int32 SerialNumber }
+	//          sizeof=24 on x64, pointer at offset 0.
+	// UE5.7+:  two additional debug fields in some builds, stride can be up to 32.
+	const uintptr_t firstBase = reinterpret_cast<uintptr_t>(FirstItemPtr);
+	constexpr int32 kNumSlotsToProbe = 256;
+
+	auto lookslikeUserPtr = [](uintptr_t p) -> bool
 	{
-		const uintptr_t slotAddr = reinterpret_cast<uintptr_t>(FirstItemPtr) + i;
-		const uintptr_t slotValue = RDeref<uintptr_t>(slotAddr);
-		if (slotValue != 0 && !Platform::IsBadReadPtr(slotValue))
+		// User-mode VAs on x64 Windows are < 0x00008000_00000000 and >= 0x10000. Rejecting
+		// null + low values and kernel-space values removes the obvious garbage without
+		// requiring a second dereference (which would fail on paged-out heap pages).
+		return p >= 0x10000 && p < 0x0000800000000000ULL;
+	};
+
+	int bestScore = 0;
+	int32 bestInitial = 0x0;
+	int32 bestStride = static_cast<int32>(sizeof(void*) + sizeof(int32) + sizeof(int32)); // 0x10 default
+
+	for (int32 initial = 0; initial <= 0x8; initial += 4)
+	{
+		for (int32 stride : { 0x18, 0x10, 0x14, 0x1C, 0x20, 0x24, 0x28, 0x2C, 0x30 })
 		{
-			FUObjectItemInitialOffset = i;
-			break;
+			int score = 0;
+			for (int32 slot = 0; slot < kNumSlotsToProbe; ++slot)
+			{
+				const uintptr_t slotAddr = firstBase + (static_cast<int64>(slot) * stride) + initial;
+				const uintptr_t obj = RDeref<uintptr_t>(slotAddr);
+				if (lookslikeUserPtr(obj))
+					++score;
+			}
+			if (score > bestScore)
+			{
+				bestScore = score;
+				bestInitial = initial;
+				bestStride = stride;
+			}
 		}
 	}
 
-	for (int i = FUObjectItemInitialOffset + sizeof(void*); i <= 0x38; i += 4)
+	// Require at least 25% hit rate; otherwise fall back to UE5 defaults and hope for the best.
+	if (bestScore >= kNumSlotsToProbe / 4)
 	{
-		const uintptr_t firstBase = reinterpret_cast<uintptr_t>(FirstItemPtr);
-		const uintptr_t SecondObject = RDeref<uintptr_t>(firstBase + i);
-		const uintptr_t ThirdObject  = RDeref<uintptr_t>(firstBase + (i * 2) - FUObjectItemInitialOffset);
-
-		if (SecondObject && !Platform::IsBadReadPtr(SecondObject)
-			&& RDeref<uintptr_t>(SecondObject) && !Platform::IsBadReadPtr(RDeref<uintptr_t>(SecondObject))
-			&& ThirdObject && !Platform::IsBadReadPtr(ThirdObject)
-			&& RDeref<uintptr_t>(ThirdObject) && !Platform::IsBadReadPtr(RDeref<uintptr_t>(ThirdObject)))
-		{
-			SizeOfFUObjectItem = i - FUObjectItemInitialOffset;
-			break;
-		}
+		FUObjectItemInitialOffset = bestInitial;
+		SizeOfFUObjectItem = bestStride;
+	}
+	else
+	{
+		std::cerr << std::format(
+			"[ObjectArray] FUObjectItem stride detection yielded only {}/{} plausible pointers; "
+			"falling back to UE5 defaults (InitialOffset=0, Stride=0x18). This usually means the "
+			"game's UObject heap is mostly paged-out — expect the offset finders to thrash.\n",
+			bestScore, kNumSlotsToProbe);
+		FUObjectItemInitialOffset = 0x0;
+		SizeOfFUObjectItem = 0x18;
 	}
 
 	Off::InSDK::ObjArray::FUObjectItemInitialOffset = FUObjectItemInitialOffset;
 	Off::InSDK::ObjArray::FUObjectItemSize = SizeOfFUObjectItem;
 
-	std::cerr << "Off::InSDK::ObjArray::FUObjectItemSize: " << Off::InSDK::ObjArray::FUObjectItemSize << "\n" << std::endl;
+	std::cerr << std::format("Off::InSDK::ObjArray::FUObjectItemSize: 0x{:X} (InitialOffset=0x{:X}, score={}/{} probes)\n\n",
+		SizeOfFUObjectItem, FUObjectItemInitialOffset, bestScore, kNumSlotsToProbe);
 }
 
 void ObjectArray::InitDecryption(uint8_t* (*DecryptionFunction)(void* ObjPtr), const char* DecryptionLambdaAsStr)
