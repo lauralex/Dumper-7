@@ -29,6 +29,14 @@ namespace RemoteMemory
 		constexpr std::chrono::seconds kCr3RevalidateCooldown{5};
 		std::atomic<uint64_t> g_Cr3RefreshCount{0};
 
+		// Periodic liveness probe — belt-and-suspenders for the byte-count-based CR3 staleness
+		// detection in ReadBuffer. Every N ReadBuffer calls we read 'MZ' at the main module
+		// base through the current CR3; if it fails, force a CR3 refresh. This catches the
+		// (rare) case where reads "succeed" against a drifted CR3 that still happens to map
+		// non-image pages. One hypercall every kMzProbeEvery reads is negligible cost.
+		constexpr uint64_t kMzProbeEvery = 4096;
+		std::atomic<uint64_t> g_ReadBufferCount{0};
+
 		inline uintptr_t PageDown(uintptr_t addr)
 		{
 			return addr & ~static_cast<uintptr_t>(PageSize - 1);
@@ -202,6 +210,21 @@ namespace RemoteMemory
 	{
 		if (!dst || size == 0)
 			return false;
+
+		// Periodic MZ liveness probe. Cheap (one qword read) and independent of whether
+		// any individual page in this ReadBuffer is resident — catches CR3 drift to a
+		// CR3 that happens to alias to non-image memory which would otherwise look like
+		// "successful reads of non-zero garbage."
+		const uint64_t nCall = g_ReadBufferCount.fetch_add(1, std::memory_order_relaxed);
+		if (g_mainModuleBase != 0 && (nCall % kMzProbeEvery) == kMzProbeEvery - 1)
+		{
+			uint16_t mz = 0;
+			if (hv::read_virt_mem(&mz, reinterpret_cast<void*>(g_mainModuleBase), sizeof(mz)) != sizeof(mz)
+				|| mz != 0x5A4D)
+			{
+				TryRefreshCr3(/*force=*/true);
+			}
+		}
 
 		uint8_t* out = static_cast<uint8_t*>(dst);
 		size_t remaining = size;
