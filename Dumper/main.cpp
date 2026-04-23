@@ -197,6 +197,10 @@ int main(int argc, char** argv)
 	std::cerr << "Main module:      0x" << std::hex << RemoteMemory::GetMainModuleBase() << std::dec << "\n";
 	std::cerr << "Main module size: 0x" << std::hex << RemoteMemory::GetMainModuleSize() << std::dec << "\n\n";
 
+	// Honour Dumper-7.ini's SleepTimeout / DumpKey — lets the operator delay the dump until the
+	// target has walked through whatever gameplay state warms the reflection + FName pages.
+	Settings::Config::DelayDumperStart();
+
 	const auto dumpStart = std::chrono::high_resolution_clock::now();
 
 	std::cerr << "[main] -> InitEngineCore\n";
