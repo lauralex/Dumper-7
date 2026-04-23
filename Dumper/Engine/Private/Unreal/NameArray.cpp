@@ -119,6 +119,35 @@ void NameArray::PopulateFNamePoolCache(uintptr_t FNamePoolRemote, int32 NumChunk
 	g_NamePoolCache.Populated = true;
 	std::cerr << std::format("[NameArray] FNamePool cache populated: {} chunks, {} KB total\n",
 		NumChunks, totalBytes / 1024);
+
+	// Diagnostic: count how many chunks have all-zero buffers (cold-heap symptom — the chunk
+	// slot was allocated but ReadBuffer's ZeroFillOnGap policy filled it with zeros). Print
+	// chunk[0] head bytes so we can tell whether "None"-resolves are from a zero cache.
+	{
+		int32 zeroBufCount = 0;
+		for (const auto& buf : g_NamePoolCache.ChunkBuffers)
+		{
+			if (buf.empty())
+				continue;
+			bool allZero = true;
+			for (size_t k = 0, n = std::min<size_t>(buf.size(), 0x40); k < n; ++k)
+			{
+				if (buf[k] != 0) { allZero = false; break; }
+			}
+			if (allZero)
+				++zeroBufCount;
+		}
+		std::cerr << std::format("[NameArray] cache integrity: zero-head chunks = {}/{}\n",
+			zeroBufCount, NumChunks);
+
+		if (!g_NamePoolCache.ChunkBuffers.empty() && g_NamePoolCache.ChunkBuffers[0].size() >= 16)
+		{
+			std::cerr << "[NameArray] chunk[0] head bytes:";
+			for (int k = 0; k < 16; ++k)
+				std::cerr << std::format(" {:02X}", g_NamePoolCache.ChunkBuffers[0][k]);
+			std::cerr << "\n";
+		}
+	}
 }
 
 
