@@ -1,4 +1,5 @@
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <vector>
@@ -164,30 +165,51 @@ void FNameEntry::Init(const uint8_t* FirstChunkPtr, int64 NameEntryStringOffset)
 		// forward for the "ByteProperty" header to determine the shift count used to encode
 		// the length field in the FNameEntry header.
 		const uintptr_t firstChunkAddr = RDeref<uintptr_t>(FirstChunkPtr);
-		uintptr_t candidate = firstChunkAddr + NameEntryStringOffset + NoneStrLen;
 
-		for (int i = 0; i < 0x4; ++i)
+		// Fast path: InitializeNamePool's chunk[0]-paged-out fallback pre-sets
+		// FNameEntryLengthShiftCount=6 (UE4.22+ standard when header size is 2). If it's
+		// already set to a sensible value and chunk[0] is unreadable, skip the ByteProperty
+		// hunt — it would scan from 0+offset and either fault or produce garbage shifts.
+		uint8_t firstChunkProbe[16]{};
+		if (firstChunkAddr != 0)
+			RemoteMemory::ReadBuffer(firstChunkAddr, firstChunkProbe, sizeof(firstChunkProbe), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		const bool bFirstChunkReadable = firstChunkAddr != 0
+			&& !std::all_of(std::begin(firstChunkProbe), std::end(firstChunkProbe), [](uint8_t b) { return b == 0; });
+
+		if (!bFirstChunkReadable && FNameEntryLengthShiftCount > 0 && FNameEntryLengthShiftCount < 16)
 		{
-			const uint32 FirstPartOfByteProperty = RDeref<uint32>(candidate + NameEntryStringOffset);
-			if (FirstPartOfByteProperty == BytePropertyStartAsUint32)
-				break;
-			candidate += 1;
+			// Shift count was pre-set by the caller; trust it.
+			std::cerr << std::format(
+				"[NameArray] FNameEntry::Init: chunk[0] unreadable; using preset FNameEntryLengthShiftCount={}\n",
+				static_cast<int32>(FNameEntryLengthShiftCount));
 		}
-
-		uint16 BytePropertyHeader = RDeref<uint16>(candidate + Off::FNameEntry::NamePool::HeaderOffset);
-		constexpr int32 MaxAllowedShiftCount = sizeof(BytePropertyHeader) * 0x8;
-
-		while (BytePropertyHeader != BytePropertyStrLen && FNameEntryLengthShiftCount < MaxAllowedShiftCount)
+		else
 		{
-			FNameEntryLengthShiftCount++;
-			BytePropertyHeader >>= 1;
-		}
+			uintptr_t candidate = firstChunkAddr + NameEntryStringOffset + NoneStrLen;
 
-		if (FNameEntryLengthShiftCount == MaxAllowedShiftCount)
-		{
-			std::cerr << "\nDumper-7: Error, couldn't get FNameEntryLengthShiftCount!\n" << std::endl;
-			GetStr = [](uint8* NameEntry) -> std::wstring { (void)NameEntry; return L"Invalid FNameEntryLengthShiftCount!"; };
-			return;
+			for (int i = 0; i < 0x4; ++i)
+			{
+				const uint32 FirstPartOfByteProperty = RDeref<uint32>(candidate + NameEntryStringOffset);
+				if (FirstPartOfByteProperty == BytePropertyStartAsUint32)
+					break;
+				candidate += 1;
+			}
+
+			uint16 BytePropertyHeader = RDeref<uint16>(candidate + Off::FNameEntry::NamePool::HeaderOffset);
+			constexpr int32 MaxAllowedShiftCount = sizeof(BytePropertyHeader) * 0x8;
+
+			while (BytePropertyHeader != BytePropertyStrLen && FNameEntryLengthShiftCount < MaxAllowedShiftCount)
+			{
+				FNameEntryLengthShiftCount++;
+				BytePropertyHeader >>= 1;
+			}
+
+			if (FNameEntryLengthShiftCount == MaxAllowedShiftCount)
+			{
+				std::cerr << "\nDumper-7: Error, couldn't get FNameEntryLengthShiftCount!\n" << std::endl;
+				GetStr = [](uint8* NameEntry) -> std::wstring { (void)NameEntry; return L"Invalid FNameEntryLengthShiftCount!"; };
+				return;
+			}
 		}
 
 		GetStr = [](uint8* NameEntry) -> std::wstring
@@ -448,30 +470,107 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 	constexpr uint64 CoreUObjAsUint64 = 0x6A624F5565726F43; // little endian "jbOUeroC" ["/Script/CoreUObject"]
 	constexpr uint32 NoneAsUint32 = 0x656E6F4E; // little endian "None"
 
-	const uintptr_t chunkPtrRemoteAddr = reinterpret_cast<uintptr_t>(NamePool) + Off::NameArray::ChunksStart;
-	const uintptr_t firstChunkAddr = RDeref<uintptr_t>(chunkPtrRemoteAddr);
-	if (firstChunkAddr == 0)
-		return false;
+	const uintptr_t chunkArrayRemoteAddr = reinterpret_cast<uintptr_t>(NamePool) + Off::NameArray::ChunksStart;
 
 	bool bFoundCoreUObjectString = false;
 	int64 FNameEntryHeaderSize = 0x0;
 
 	constexpr int32 LoopLimit = 0x1000;
 
-	for (int i = 0; i < LoopLimit; i++)
+	// Derive FNameEntryHeaderSize from any readable chunk — not only chunk[0].
+	//
+	// Failure case we saw on MHUR.exe (UE 4.27 from-source build, idle chunks can page out
+	// because they contain cold registrations that the game never touches post-init): chunk[0]
+	// pages out, chunk[1+] stay resident because they hold gameplay-active class names.
+	// The classic algorithm scanned *only* chunk[0] for "None" (header-size anchor) and
+	// "/Script/CoreUObject" (sanity), and bailed if either was unreachable.
+	//
+	// FNameEntryHeaderSize is a property of the pool, invariant across chunks. Every chunk's
+	// first entry starts at offset 0 with the same header layout, so we can determine the
+	// header size from any readable chunk. Chunk[0] is still preferred (it lets us also
+	// sanity-check on the "/Script/CoreUObject" string); only fall back when it's unusable.
+	const int32 maxChunkIdxValue = RDeref<int32>(NamePool + Off::NameArray::MaxChunkIndex);
+	// Bulk-read every chunk pointer so we don't issue (probe-count) separate hypercalls in the
+	// scan loop. On an idle MHUR.exe the first ~150 chunks can be paged out, so capping the probe
+	// at 16 (our original timid limit) meant we never found a live chunk and bailed with the
+	// "couldn't be used by the generator" misleading error even though the pool was valid.
+	const int32 chunksToProbe = std::min<int32>(maxChunkIdxValue + 1, 256);
+	std::vector<uintptr_t> cachedChunkPtrs(chunksToProbe, 0);
+	RemoteMemory::ReadBuffer(chunkArrayRemoteAddr, cachedChunkPtrs.data(),
+		chunksToProbe * sizeof(uintptr_t), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+
+	auto isProbeChunkReadable = [](uintptr_t chunkAddr) -> bool
 	{
-		if (RDeref<uint32>(firstChunkAddr + i) == NoneAsUint32 && FNameEntryHeaderSize == 0)
+		if (chunkAddr == 0)
+			return false;
+		uint8_t sniff[32]{};
+		RemoteMemory::ReadBuffer(chunkAddr, sniff, sizeof(sniff), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		// If every byte is zero, the page is either not mapped (HV read returned zeros) or the
+		// chunk genuinely has no content yet. Either way it's useless for header detection.
+		return !std::all_of(std::begin(sniff), std::end(sniff), [](uint8_t b) { return b == 0; });
+	};
+
+	// Check whether a uint16 at offset 0 parses as a plausible UE4.22+ FNamePool header
+	// (bIsWide:1, ProbeHash:5, Len:10). We require wide=0 and a printable-ASCII string of
+	// declared length, which is nearly impossible to satisfy by accident on non-name data.
+	auto validateHeader2 = [](uintptr_t chunkAddr) -> bool
+	{
+		const uint16 hdr = RDeref<uint16>(chunkAddr);
+		const bool wide = (hdr & 1) != 0;
+		const int32 len = hdr >> 6;
+		if (wide || len < 2 || len > 256)
+			return false;
+		for (int k = 0; k < len; ++k)
 		{
-			FNameEntryHeaderSize = i;
+			const uint8 b = RDeref<uint8>(chunkAddr + 2 + k);
+			if (b < 0x20 || b > 0x7E)
+				return false;
 		}
-		else if (RDeref<uint64>(firstChunkAddr + i) == CoreUObjAsUint64)
+		return true;
+	};
+
+	uintptr_t firstChunkAddr = cachedChunkPtrs.empty() ? 0 : cachedChunkPtrs[0];
+	for (int32 probeIdx = 0; probeIdx < chunksToProbe && !bFoundCoreUObjectString; ++probeIdx)
+	{
+		const uintptr_t probeChunkAddr = cachedChunkPtrs[probeIdx];
+		if (!isProbeChunkReadable(probeChunkAddr))
+			continue;
+
+		if (probeIdx == 0)
 		{
-			bFoundCoreUObjectString = true;
-			break;
+			// Chunk 0 is live: use the classic scan for "None" (header-size anchor) and
+			// "/Script/CoreUObject" (pool identity confirmation).
+			for (int i = 0; i < LoopLimit; i++)
+			{
+				if (RDeref<uint32>(probeChunkAddr + i) == NoneAsUint32 && FNameEntryHeaderSize == 0)
+				{
+					FNameEntryHeaderSize = i;
+				}
+				else if (RDeref<uint64>(probeChunkAddr + i) == CoreUObjAsUint64)
+				{
+					bFoundCoreUObjectString = true;
+					break;
+				}
+			}
+		}
+		else
+		{
+			// Chunk 0 was paged out. Derive header size from this readable chunk's entry at
+			// offset 0. The structural FNamePool validation (matching MaxChunkIndex against
+			// the non-null pointer count above) already gives high confidence this is the
+			// real pool; the printable-ASCII header-2 test is the final empirical check.
+			if (validateHeader2(probeChunkAddr))
+			{
+				FNameEntryHeaderSize = 2;
+				bFoundCoreUObjectString = true;
+				std::cerr << std::format(
+					"[NameArray] chunk[0] paged out; derived FNameEntryHeaderSize=2 from chunk[{}] at 0x{:X}\n",
+					probeIdx, probeChunkAddr);
+			}
 		}
 	}
 
-	if (!bFoundCoreUObjectString)
+	if (!bFoundCoreUObjectString || firstChunkAddr == 0)
 		return false;
 
 	NameEntryStride = FNameEntryHeaderSize == 2 ? 2 : 4;
@@ -518,7 +617,18 @@ bool NameArray::InitializeNamePool(uint8_t* NamePool)
 			ByteCursor);
 	}
 
-	FNameEntry::Init(reinterpret_cast<uint8*>(chunkPtrRemoteAddr), FNameEntryHeaderSize);
+	// When we derived the header size via the fallback (chunk[0] paged out), we also already
+	// know we're on the UE4.22+ standard 2-byte header layout which always uses shift=6. Pre-
+	// set the shift count and pass the first readable chunk so FNameEntry::Init doesn't go hunting
+	// for "ByteProperty" in a chunk[0] it can't read.
+	const bool bChunkZeroWasUsable = (firstChunkAddr != 0)
+		&& [&]() { uint8_t s[32]{}; RemoteMemory::ReadBuffer(firstChunkAddr, s, sizeof(s), RemoteMemory::PartialReadPolicy::ZeroFillOnGap);
+		           return !std::all_of(std::begin(s), std::end(s), [](uint8_t b) { return b == 0; }); }();
+	if (!bChunkZeroWasUsable)
+	{
+		FNameEntry::FNameEntryLengthShiftCount = 6;
+	}
+	FNameEntry::Init(reinterpret_cast<uint8*>(chunkArrayRemoteAddr), FNameEntryHeaderSize);
 
 	return true;
 }
@@ -814,8 +924,129 @@ void NameArray::PostInit()
 			}
 			NameArray::FNameBlockOffsetBits = bits;
 			std::cerr << std::format(
-				"[NameArray] PostInit: bits={} (derived from ByteCursor=0x{:X} stride={})\n",
+				"[NameArray] PostInit: bits={} (ByteCursor-minimum from 0x{:X} stride={})\n",
 				NameArray::FNameBlockOffsetBits, ByteCursor, NameEntryStride);
+
+			// ByteCursor gives the MINIMUM chunk size that still fits the last chunk's current
+			// write offset — but the actual chunk allocations can be any larger power of 2. On
+			// MHUR (UE4.27 with 64KB FNamePool blocks) the last chunk only held 0x2D2E bytes so
+			// the minimum came out as bits=13 (16KB chunks), but the actual chunks are 64KB
+			// (bits=15). Using the undershooting value makes every FName.CompIdx >= 8192 resolve
+			// to garbage bytes in a later chunk, which then get read as wildly-long entries and
+			// the dumper ballooned to 9 GB RSS allocating junk wstrings before being killed.
+			//
+			// Bits correction: try candidate {15, 16, 17} and validate each against real UObject
+			// FNames. For each candidate, resolve 10 well-distributed UObject CompIdx values and
+			// count how many resolve to a printable-ASCII FName entry. The candidate with ≥80%
+			// validation wins; that's the "real" bits.
+			//
+			// Why this beats the previous probe-the-chunk-boundary approach: Windows heap places
+			// same-sized FName chunk allocations near each other (same LFH bucket), so chunk[N]'s
+			// alleged "tail" at chunk[N]+0x40000 is frequently *another* chunk's head. Heuristic
+			// scans for "non-zero" or "looks ASCII" at alleged chunk ends can't distinguish those
+			// cases and consistently overshoot. Verification against actual CompIdx values is the
+			// only signal that unambiguously maps bits → correct-or-not.
+			//
+			// Sampling strategy: pick 10 UObjects distributed across the whole ObjectArray range,
+			// filtering for ones whose chunk resolves to a mapped page (paged-out chunks can't
+			// be validated — they return zeros for all bits, which looks like failure everywhere).
+			// Given this target's paging pattern (cold chunks get swapped to disk), we don't
+			// require all samples to succeed — just need enough hits to tiebreak between bits
+			// candidates.
+			auto resolveFNameStr = [](uintptr_t fnamePoolAddr, int32 compIdx, int32 bits,
+				int32 stride, int32 chunksStartOff, int32 numChunks) -> std::pair<bool, std::string>
+			{
+				const int32 chunkIdx = compIdx >> bits;
+				const int32 inChunkOffset = (compIdx & ((1 << bits) - 1)) * stride;
+				if (chunkIdx < 0 || chunkIdx >= numChunks)
+					return { false, "" };
+				const uintptr_t chunkBase = RDeref<uintptr_t>(fnamePoolAddr + chunksStartOff + chunkIdx * 8);
+				if (chunkBase == 0)
+					return { false, "" };
+				const uintptr_t entryAddr = chunkBase + inChunkOffset;
+				uint8_t buf[258]{};
+				if (!RemoteMemory::ReadBuffer(entryAddr, buf, sizeof(buf), RemoteMemory::PartialReadPolicy::ZeroFillOnGap))
+					return { false, "" };
+				const uint16 hdr = static_cast<uint16>(buf[0]) | (static_cast<uint16>(buf[1]) << 8);
+				const bool wide = (hdr & 1) != 0;
+				const int32 len = hdr >> 6;
+				if (wide || len < 2 || len > 256)
+					return { false, "" };
+				for (int k = 0; k < len; ++k)
+				{
+					const uint8 b = buf[2 + k];
+					if (b < 0x20 || b > 0x7E)
+						return { false, "" };
+				}
+				return { true, std::string(reinterpret_cast<char*>(buf + 2), len) };
+			};
+
+			const int32 numChunks = GetNumChunks() + 1;
+			const int32 chunksStartOff = Off::NameArray::ChunksStart;
+			const int32 totalObjects = ObjectArray::Num();
+
+			std::vector<int32> sampleCompIdxs;
+			if (totalObjects > 0)
+			{
+				const int32 kNumSamples = 48;
+				for (int32 s = 0; s < kNumSamples; ++s)
+				{
+					const int32 objIdx = (totalObjects / kNumSamples) * s + (totalObjects / (kNumSamples * 2));
+					UEObject obj = ObjectArray::GetByIndex(objIdx);
+					if (!obj) continue;
+					const int32 compIdx = obj.GetFName().GetCompIdx();
+					if (compIdx > 0)
+						sampleCompIdxs.push_back(compIdx);
+				}
+			}
+
+			int32 bestBits = NameArray::FNameBlockOffsetBits;
+			int32 bestHits = -1;
+			std::string bestExample;
+			for (int32 cand : { 15, 16, 17, 14, 13 })
+			{
+				if (cand < NameArray::FNameBlockOffsetBits)
+					continue; // never downshift below ByteCursor minimum
+				int32 hits = 0;
+				std::string firstExample;
+				for (int32 compIdx : sampleCompIdxs)
+				{
+					auto [ok, str] = resolveFNameStr(
+						reinterpret_cast<uintptr_t>(GNames), compIdx, cand,
+						NameEntryStride, chunksStartOff, numChunks);
+					if (ok)
+					{
+						++hits;
+						if (firstExample.empty()) firstExample = str;
+					}
+				}
+				if (hits > bestHits)
+				{
+					bestHits = hits;
+					bestBits = cand;
+					bestExample = firstExample;
+				}
+				std::cerr << std::format(
+					"[NameArray] PostInit: bits={} candidate -> {}/{} samples resolved (example: \"{}\")\n",
+					cand, hits, static_cast<int32>(sampleCompIdxs.size()), firstExample);
+			}
+
+			if (bestHits > 0 && bestBits != NameArray::FNameBlockOffsetBits)
+			{
+				std::cerr << std::format(
+					"[NameArray] PostInit: bits corrected from {} to {} (validated via {} UObject FName samples, "
+					"best example resolved to \"{}\")\n",
+					NameArray::FNameBlockOffsetBits, bestBits, bestHits, bestExample);
+				NameArray::FNameBlockOffsetBits = bestBits;
+			}
+			else if (bestHits == 0)
+			{
+				std::cerr << "[NameArray] PostInit: UObject-sample validation found ZERO hits for any bits — "
+				             "FNamePool chunks probably all paged out. Falling back to bits=16 "
+				             "(UE4.22+ standard). If resolved names look garbled, rerun while the "
+				             "target is actively in-game to keep pages resident.\n";
+				NameArray::FNameBlockOffsetBits = std::max<int32>(NameArray::FNameBlockOffsetBits, 16);
+			}
 		}
 		else
 		{
