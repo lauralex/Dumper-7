@@ -30,6 +30,11 @@ The DLL has no CLI — it runs from `DllMain` → `MainThread`. To exercise it: 
 
 Per-run config can be put in `Dumper-7.ini` (next to the game exe for per-game, or `C:/Dumper-7/Dumper-7.ini` global). Only `SleepTimeout` and `SDKNamespaceName` are runtime-configurable; everything else is in `Dumper/Settings.h` and requires a rebuild.
 
+### Two operating modes
+
+- **`main` branch (DLL injection)** — described above. `Dumper-7.dll` is injected into the target; runs from `DllMain` → `MainThread`.
+- **`external-mode-hv-nebula` branch (external binary + hypervisor)** — `Dumper-7.exe` is a standalone CLI that reads the target's memory via `hv-nebula` hypervisor hypercalls instead of injecting. Useful for anti-cheat-protected targets where DLL injection or `ReadProcessMemory` are blocked at the kernel level. Run with `Dumper-7.exe --process <name.exe>` or `--pid <N>`; requires the `hv-nebula` driver loaded on the host (see the `reference_sibling_projects` memory for hv-nebula/hv-mcp locations and the edit → rebuild driver → reload HV → rebuild MCP → rebuild Dumper-7 workflow).
+
 ## Architecture
 
 The dumper has a clean four-layer split. Headers live under `<Layer>/Public/...`, implementations under `<Layer>/Private/...`, and `Dumper/` is added as a root include directory so `#include "Unreal/ObjectArray.h"` works from anywhere.
@@ -62,6 +67,9 @@ The Generator layer runs on top of Engine via two indirections that exist for go
 ### Platform — OS/architecture abstraction (`Dumper/Platform/`)
 Currently Windows-only. The Linux/Android paths in `Architecture.h` and `Platform.h` `#error` out. Platform-specific entry points use the `_Windows` postfix and are dispatched through `CALL_PLATFORM_SPECIFIC_FUNCTION(...)`. `Arch_x86.cpp` does the actual disassembly used by `OffsetFinder` to walk call sites and find vtable indices.
 
+### Memory — external-process access (`Dumper/Memory/`, external-mode branch only)
+`RemoteMemory` is the abstraction every upper layer reads through: no-op identity when running as an injected DLL, and `hv-nebula` VMCALL reads when running as an external binary. `RemoteContainers` mirrors `TArray` / `FString` / `TMap` / `TSet` with remote-read semantics so Engine-layer code can dereference remote pointers without open-coding hypercalls. `HvProbe` detects whether the hypervisor is loaded before any VMCALL. `hv.h` / `hv.asm` are vendored copies of the hv-nebula user-mode binding — re-vendor them whenever the hypercall surface (hypercall numbers, argument layout) changes on the hv-nebula side.
+
 ### Utils — leaf-level helpers (`Dumper/Utils/`)
 `Utils.h` (string/byte helpers), `Json/json.hpp` (nlohmann), `Compression/zstd.h` (header-only zstd, used by `MappingGenerator`), `Encoding/UnicodeNames.h`, `Dumpspace/DSGen.cpp` (vendored dumpspace serializer).
 
@@ -79,6 +87,8 @@ The startup sequence in `Generator.cpp` has hard ordering constraints. From `mai
 
 When a game's `GObjects` / `GNames` / `AppendString` / `ProcessEvent` / `GObjects` decryption isn't auto-discovered, the user is expected to edit `Generator::InitEngineCore()` directly and call the explicit `::Init(...)` overloads (commented examples are at the top of the function). New `FChunkedFixedUObjectArrayLayout` shapes go in the `FChunkedFixedUObjectArrayLayouts` array in `ObjectArray.cpp`. This is the documented workflow — see the `Overriding Offsets` and `Overriding GObjects-Layout` sections in `README.md`. Don't refactor these into config: they're per-game and need to be in source.
 
+**Target-specific findings (live addresses, chunk layouts, engine-version quirks, paging behaviour, anti-cheat fingerprint) live in per-target memory files** under `~/.claude/projects/.../memory/project_<target>_target.md`, NOT in CLAUDE.md and NOT in source comments. CLAUDE.md describes what is structurally true about the project across every target; memory files capture what was true for a specific game at a specific session. Chunk counts, VAs, RVAs, and discovered offsets rot across game patches — never inline them in CLAUDE.md or in comments in source files.
+
 ## Other notes
 
 - Engine version flags live in `Settings::Internal::*` and are set by `InitSettings()` at runtime — *not* compile-time. Code that branches on engine version reads these flags.
@@ -86,3 +96,4 @@ When a game's `GObjects` / `GNames` / `AppendString` / `ProcessEvent` / `GObject
 - The build defines the project as `Dumper-7` (not `Dumper`); the produced DLL is `Dumper-7.dll`.
 - `Settings.h` knobs like `bForceNoGWorldInSDK`, `bAddManualOverrideOptions`, `XORString` change the *generated SDK*, not the dumper itself — they only matter at SDK-emit time.
 - See `UsingTheSDK.md` for what the *consumer* of the generated SDK does (it's a separate VS project; not built from this repo).
+- `EXTERNAL_MODE_FINDINGS.md` (repo root) is a living session-diagnostic file for the external-mode branch. Append new diagnoses and dead-ends there rather than starting from scratch — it's the historical record of what has and hasn't worked across targets.
