@@ -304,12 +304,22 @@ void Off::Init()
 
 		OffsetFinder::FixupHardcodedOffsets(); // must be called after FindChildPropertiesOffset
 
+		// FixupHardcodedOffsets may have shifted the FField layout by -0x08 to account for UE5.1.1+
+		// FFieldVariant shrinkage. Capture the post-fixup values BEFORE the finders run so we can
+		// fall back to them if the finders return OffsetNotFound (e.g. on external-mode targets
+		// where the FField heap is paged out and GetValidPointerOffset probes read zeros).
+		// Without this, OverwriteIfInvalidOffset would stomp back to the hardcoded pre-shrinkage
+		// default and produce the wrong layout on legitimately shrunk targets.
+		const int32 FFieldNextFallback  = Off::FField::Next;
+		const int32 FFieldClassFallback = Off::FField::Class;
+		const int32 FFieldNameFallback  = Off::FField::Name;
+
 		Off::FField::Next = OffsetFinder::FindFFieldNextOffset();
-		OverwriteIfInvalidOffset(Off::FField::Next, 0x20); // UE5.1 default (pre-CasePreserving adjustment)
+		OverwriteIfInvalidOffset(Off::FField::Next, FFieldNextFallback);
 		std::cerr << std::format("Off::FField::Next: 0x{:X}\n", Off::FField::Next);
 
 		Off::FField::Class = OffsetFinder::FindFFieldClassOffset();
-		OverwriteIfInvalidOffset(Off::FField::Class, 0x08);
+		OverwriteIfInvalidOffset(Off::FField::Class, FFieldClassFallback);
 		std::cerr << std::format("Off::FField::Class: 0x{:X}\n", Off::FField::Class);
 
 		// Comment out this line if you're crashing here and see if the NewFindFFieldNameOffset might work!
@@ -319,7 +329,7 @@ void Off::Init()
 		if (Off::FField::Name == OffsetFinder::OffsetNotFound)
 			Off::FField::Name = OffsetFinder::NewFindFFieldNameOffset();
 
-		OverwriteIfInvalidOffset(Off::FField::Name, 0x28); // UE5.1 default
+		OverwriteIfInvalidOffset(Off::FField::Name, FFieldNameFallback);
 		std::cerr << std::format("Off::FField::Name: 0x{:X}\n", Off::FField::Name);
 
 		/*
